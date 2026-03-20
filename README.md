@@ -17,6 +17,8 @@ AI-powered photo organization with person and animal detection, featuring debug 
 
 This project follows Google's engineering best practices with a modular architecture:
 - `src/`: Contains core logic (`ImageProcessor`, `DetectionMetadata`, `LabelManager` classes)
+- `src/mirror_manager.py`: Blueprint for immutable `source_originals` handling with a separate `mirror_workspace`
+- `src/intelligence_core.py`: Blueprint for GPU-backed embeddings, vector search, and active-learning verification
 - `tests/`: Contains PyTest test cases with mocking
 - `main.py`: Command-line photo processing with crop generation
 - `web_ui.py`: Flask backend serving APIs, image routes, and the built React frontend
@@ -56,6 +58,27 @@ pip install -r requirements.txt
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+### Optional GPU Learning Stack
+
+The new blueprint modules are import-safe by default, but the SOTA learning path
+needs additional packages that depend on your GPU and vector-store choice.
+
+```bash
+# Core active-learning stack
+pip install transformers accelerate safetensors
+
+# Qdrant client if you want a persistent vector DB instead of in-memory search
+pip install qdrant-client
+
+# Install the GPU build of torch that matches your CUDA runtime
+# Example only; pick the correct index URL for your driver/toolkit version.
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+```
+
+The blueprint classes to start from are:
+- `MirrorManager` in `src/mirror_manager.py`
+- `IntelligenceCore` in `src/intelligence_core.py`
 
 ## Usage
 

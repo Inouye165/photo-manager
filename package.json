@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "name": "photofinder",
+  "scripts": {
+    "start:local": "node scripts/start-server.mjs",
+    "stop:local": "node scripts/stop-server.mjs"
+  }
+}

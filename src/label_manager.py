@@ -85,6 +85,10 @@ class LabelManager:
             return None
         return self.output_dir / normalized
 
+    def resolve_stored_path(self, path_value: Optional[str]) -> Optional[Path]:
+        """Public wrapper for resolving stored paths inside output_dir."""
+        return self._resolve_stored_path(path_value)
+
     def _get_export_category(self, detected_class: str) -> str:
         return "people" if detected_class == "person" else "animals"
 
