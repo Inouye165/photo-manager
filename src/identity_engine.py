@@ -28,6 +28,8 @@ class IdentityPrototype:
     category: str
     sample_count: int
     centroid: np.ndarray
+    exemplars: tuple[np.ndarray, ...]
+    observed_classes: tuple[str, ...]
 
 
 class IdentityEngine:
@@ -51,6 +53,10 @@ class IdentityEngine:
 
         image = cv2.imread(str(image_path))
         return image
+
+    def _get_detection_class(self, detection: Dict) -> str:
+        detected_class = detection.get("detected_class") or detection.get("class_name") or ""
+        return str(detected_class).strip().lower()
 
     def _extract_signature(self, image_path: Path) -> Optional[np.ndarray]:
         image = self._load_image(image_path)
@@ -80,15 +86,17 @@ class IdentityEngine:
 
     def build_index(self, label_manager: LabelManager) -> List[IdentityPrototype]:
         grouped_signatures: Dict[tuple[str, str], List[np.ndarray]] = {}
+        grouped_classes: Dict[tuple[str, str], set[str]] = {}
 
         for label_record in label_manager.get_all_labels(status="confirmed"):
             assigned_label = label_record.get("assigned_label", "").strip()
             if not assigned_label:
                 continue
 
-            category = self._category_for_detection(label_record.get("detected_class", ""))
-            crop_path = label_manager._resolve_stored_path(label_record.get("crop_path"))
-            image_path = label_manager._resolve_stored_path(label_record.get("image_path"))
+            detected_class = str(label_record.get("detected_class", "")).strip().lower()
+            category = self._category_for_detection(detected_class)
+            crop_path = label_manager.resolve_stored_path(label_record.get("crop_path"))
+            image_path = label_manager.resolve_stored_path(label_record.get("image_path"))
             source_path = crop_path if crop_path and crop_path.exists() else image_path
 
             if not source_path or not source_path.exists():
@@ -98,7 +106,9 @@ class IdentityEngine:
             if signature is None:
                 continue
 
-            grouped_signatures.setdefault((assigned_label, category), []).append(signature)
+            prototype_key = (assigned_label, category)
+            grouped_signatures.setdefault(prototype_key, []).append(signature)
+            grouped_classes.setdefault(prototype_key, set()).add(detected_class)
 
         prototypes: List[IdentityPrototype] = []
         for (assigned_label, category), signatures in grouped_signatures.items():
@@ -113,6 +123,8 @@ class IdentityEngine:
                     category=category,
                     sample_count=len(signatures),
                     centroid=centroid / norm,
+                    exemplars=tuple(signatures[: min(6, len(signatures))]),
+                    observed_classes=tuple(sorted(grouped_classes.get((assigned_label, category), set()))),
                 )
             )
 
@@ -124,7 +136,7 @@ class IdentityEngine:
         detection: Dict,
         min_samples: int = 2,
     ) -> Optional[Dict[str, object]]:
-        category = self._category_for_detection(detection.get("class_name", ""))
+        category = self._category_for_detection(self._get_detection_class(detection))
         prototypes = self.build_index(label_manager)
         return self.suggest_from_prototypes(detection, prototypes, min_samples=min_samples, category=category)
 
@@ -135,11 +147,15 @@ class IdentityEngine:
         min_samples: int = 2,
         category: Optional[str] = None,
     ) -> Optional[Dict[str, object]]:
-        resolved_category = category or self._category_for_detection(detection.get("class_name", ""))
+        detected_class = self._get_detection_class(detection)
+        resolved_category = category or self._category_for_detection(detected_class)
+        required_samples = min_samples if resolved_category == "people" else max(1, min_samples - 1)
         filtered_prototypes = [
             prototype
             for prototype in prototypes
-            if prototype.category == resolved_category and prototype.sample_count >= min_samples
+            if prototype.category == resolved_category
+            and prototype.sample_count >= required_samples
+            and (resolved_category == "people" or detected_class in prototype.observed_classes)
         ]
 
         if not filtered_prototypes:
@@ -162,12 +178,23 @@ class IdentityEngine:
 
         scored: List[Dict[str, object]] = []
         for prototype in filtered_prototypes:
-            similarity = float(np.dot(signature, prototype.centroid))
+            centroid_score = float(np.dot(signature, prototype.centroid))
+            exemplar_scores = sorted((float(np.dot(signature, exemplar)) for exemplar in prototype.exemplars), reverse=True)
+
+            if resolved_category == "people" and exemplar_scores:
+                exemplar_slice = exemplar_scores[: min(2, len(exemplar_scores))]
+                exemplar_score = sum(exemplar_slice) / len(exemplar_slice)
+                similarity = (centroid_score * 0.58) + (exemplar_score * 0.42)
+            else:
+                similarity = centroid_score
+
             confidence = max(0.0, min(0.999, (similarity + 1.0) / 2.0))
             scored.append(
                 {
                     "name": prototype.name,
                     "score": similarity,
+                    "centroid_score": centroid_score,
+                    "exemplar_score": exemplar_scores[0] if exemplar_scores else centroid_score,
                     "confidence": confidence,
                     "sample_count": prototype.sample_count,
                 }
@@ -175,11 +202,16 @@ class IdentityEngine:
 
         scored.sort(key=lambda item: item["score"], reverse=True)
         best = scored[0]
+        min_score = 0.8 if resolved_category == "people" else 0.86
 
-        if best["score"] < 0.72:
+        if best["score"] < min_score:
             return None
 
         runner_up_gap = best["score"] - scored[1]["score"] if len(scored) > 1 else best["score"]
+        min_gap = 0.01 if resolved_category == "people" else 0.03
+
+        if runner_up_gap < min_gap:
+            return None
 
         return {
             "label": best["name"],

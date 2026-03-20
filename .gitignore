@@ -8,6 +8,9 @@ Thumbs.db
 
 # Local data and generated outputs
 working_dir/
+working_dir__mirror_workspace/
+.server.pid
+server.log
 extract_pictures.log
 debug_output*.txt
 test_out*.txt

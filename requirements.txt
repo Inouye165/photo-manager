@@ -1,7 +1,9 @@
 opencv-python
 numpy
 pytest
+pydantic>=2,<3
 pillow-heif
 Pillow
 ultralytics
 flask
+waitress
