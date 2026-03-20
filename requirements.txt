@@ -1,0 +1,7 @@
+opencv-python
+numpy
+pytest
+pillow-heif
+Pillow
+ultralytics
+flask

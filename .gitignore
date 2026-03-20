@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.pyc
+Thumbs.db
+
+# Python tooling
+.pytest_cache/
+
+# Local data and generated outputs
+working_dir/
+extract_pictures.log
+debug_output*.txt
+test_out*.txt
+
+# Downloaded model weights
+yolov8m.pt
+yolov8n.pt
+
+# Frontend artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/

@@ -1,0 +1,18 @@
+html {
+  font-family: 'Trebuchet MS', 'Segoe UI', sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  min-width: 320px;
+}
+
+a,
+button,
+input,
+select {
+  font: inherit;
+}
