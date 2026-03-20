@@ -4,13 +4,13 @@
   --ink: #1a251d;
   --muted: #5e685f;
   --card: rgba(255, 250, 241, 0.85);
-  --card-strong: rgba(255, 252, 246, 0.95);
   --line: rgba(26, 37, 29, 0.1);
   --teal: #1b675f;
   --coral: #cc6d48;
   --sun: #efb45f;
   --moss: #506b56;
   --berry: #905069;
+  --danger: #c55342;
   --shadow: 0 24px 60px rgba(34, 41, 30, 0.14);
 }
 
@@ -45,7 +45,7 @@ body::before {
 }
 
 .app-shell {
-  width: min(1480px, calc(100vw - 36px));
+  width: min(1500px, calc(100vw - 36px));
   margin: 0 auto;
   padding: 24px 0 48px;
 }
@@ -54,9 +54,12 @@ body::before {
 .stat-card,
 .section-panel,
 .identity-card,
+.identity-mini-card,
 .lane-card,
 .status-panel,
-.empty-panel {
+.empty-panel,
+.detection-card,
+.focus-card {
   background: var(--card);
   border: 1px solid rgba(255, 255, 255, 0.55);
   box-shadow: var(--shadow);
@@ -73,6 +76,10 @@ body::before {
   overflow: hidden;
   background: linear-gradient(135deg, rgba(26, 58, 53, 0.95), rgba(27, 103, 95, 0.9) 55%, rgba(204, 109, 72, 0.9));
   color: #fff8ef;
+}
+
+.lab-hero {
+  background: linear-gradient(135deg, rgba(25, 59, 54, 0.96), rgba(144, 80, 105, 0.88) 55%, rgba(204, 109, 72, 0.92));
 }
 
 .eyebrow {
@@ -97,19 +104,22 @@ body::before {
 .hero-panel h2,
 .section-heading h2,
 .identity-body h3,
+.identity-mini-card h3,
 .lane-card h3,
-.stat-value {
+.stat-value,
+.detection-class {
   font-family: Rockwell, Georgia, serif;
 }
 
 .hero-panel h1 {
-  font-size: clamp(2.6rem, 4vw, 4.8rem);
+  font-size: clamp(2.5rem, 4vw, 4.8rem);
   line-height: 0.92;
   margin: 0 0 16px;
-  max-width: 9ch;
+  max-width: 10ch;
 }
 
-.hero-panel p {
+.hero-panel p,
+.hero-sidebar p {
   max-width: 58ch;
   line-height: 1.6;
   color: rgba(255, 248, 239, 0.84);
@@ -122,6 +132,25 @@ body::before {
   margin-top: 22px;
 }
 
+.action,
+.text-link,
+.quick-label,
+.accept-suggestion,
+.btn-confirm,
+.btn-reject {
+  transition: transform 0.18s ease, filter 0.18s ease;
+}
+
+.action:hover,
+.text-link:hover,
+.quick-label:hover,
+.accept-suggestion:hover,
+.btn-confirm:hover,
+.btn-reject:hover {
+  transform: translateY(-2px);
+  filter: brightness(1.04);
+}
+
 .action {
   display: inline-flex;
   align-items: center;
@@ -131,12 +160,6 @@ body::before {
   border-radius: 999px;
   text-decoration: none;
   font-weight: 700;
-  transition: transform 0.18s ease;
-}
-
-.action:hover,
-.text-link:hover {
-  transform: translateY(-2px);
 }
 
 .action-primary {
@@ -162,7 +185,10 @@ body::before {
 
 .hero-chip,
 .stage-pill,
-.chip-row span {
+.chip-row span,
+.subject-pill,
+.confidence-pill,
+.status-ribbon {
   display: inline-flex;
   align-items: center;
   width: fit-content;
@@ -183,6 +209,10 @@ body::before {
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 14px;
   margin-bottom: 24px;
+}
+
+.lab-stats-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
 .stat-card {
@@ -214,12 +244,20 @@ body::before {
   margin-bottom: 24px;
 }
 
+.compact-panel {
+  padding: 20px;
+}
+
 .section-heading {
   display: flex;
   justify-content: space-between;
   align-items: end;
   gap: 16px;
   margin-bottom: 20px;
+}
+
+.compact-heading {
+  margin-bottom: 16px;
 }
 
 .section-heading h2 {
@@ -232,7 +270,6 @@ body::before {
   color: var(--teal);
   font-weight: 700;
   text-decoration: none;
-  transition: transform 0.18s ease;
 }
 
 .identity-grid {
@@ -252,7 +289,9 @@ body::before {
 }
 
 .identity-cover img,
-.thumb-card img {
+.thumb-card img,
+.focus-card img,
+.detection-image img {
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -268,7 +307,8 @@ body::before {
   color: rgba(255, 248, 239, 0.92);
 }
 
-.identity-body {
+.identity-body,
+.identity-mini-card {
   padding: 18px;
   display: grid;
   gap: 12px;
@@ -281,9 +321,11 @@ body::before {
   align-items: center;
 }
 
-.identity-body h3 {
+.identity-body h3,
+.identity-mini-card h3,
+.lane-card h3 {
   margin: 0;
-  font-size: 1.5rem;
+  font-size: 1.45rem;
 }
 
 .stage-pill {
@@ -322,8 +364,14 @@ body::before {
 }
 
 .identity-body p,
+.identity-mini-card p,
 .empty-panel,
-.lane-card p {
+.lane-card p,
+.focus-body span,
+.current-label,
+.suggestion-meta,
+.detection-filename,
+.status-panel {
   color: var(--muted);
   line-height: 1.5;
   margin: 0;
@@ -342,11 +390,6 @@ body::before {
 
 .lane-header {
   margin-bottom: 14px;
-}
-
-.lane-card h3 {
-  margin: 0 0 4px;
-  font-size: 1.35rem;
 }
 
 .thumb-grid {
@@ -400,30 +443,237 @@ body::before {
   padding: 14px;
 }
 
-@media (max-width: 1120px) {
-  .stats-grid {
+.lab-layout {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  gap: 20px;
+}
+
+.lab-sidebar {
+  display: grid;
+  gap: 18px;
+  align-content: start;
+}
+
+.focus-card {
+  overflow: hidden;
+  border-radius: 22px;
+}
+
+.focus-card img {
+  height: 220px;
+}
+
+.focus-body {
+  padding: 16px;
+  display: grid;
+  gap: 8px;
+}
+
+.focus-body strong {
+  font-size: 1.06rem;
+}
+
+.queue-panel {
+  min-width: 0;
+}
+
+.detection-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 18px;
+}
+
+.detection-card {
+  border-radius: 24px;
+  overflow: hidden;
+}
+
+.detection-image {
+  position: relative;
+  height: 235px;
+  background: rgba(26, 37, 29, 0.06);
+}
+
+.subject-pill,
+.confidence-pill,
+.status-ribbon {
+  position: absolute;
+  color: #fff8ef;
+}
+
+.subject-pill {
+  top: 14px;
+  left: 14px;
+  background: rgba(25, 59, 54, 0.84);
+}
+
+.confidence-pill {
+  top: 14px;
+  right: 14px;
+  background: rgba(204, 109, 72, 0.88);
+}
+
+.status-ribbon {
+  left: 14px;
+  bottom: 14px;
+  background: rgba(255, 248, 239, 0.9);
+  color: var(--ink);
+}
+
+.detection-body {
+  padding: 18px;
+  display: grid;
+  gap: 12px;
+}
+
+.detection-topline {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: start;
+}
+
+.detection-class {
+  font-size: 1.3rem;
+  line-height: 0.95;
+}
+
+.quick-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.quick-label,
+.accept-suggestion,
+.btn-confirm,
+.btn-reject {
+  min-height: 38px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0 14px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.quick-label {
+  background: rgba(26, 37, 29, 0.05);
+  color: var(--ink);
+}
+
+.suggestion-box {
+  border-radius: 18px;
+  padding: 12px 14px;
+  background: linear-gradient(135deg, rgba(27, 103, 95, 0.12), rgba(239, 180, 95, 0.14));
+  border: 1px solid rgba(27, 103, 95, 0.12);
+  display: grid;
+  gap: 8px;
+}
+
+.suggestion-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.suggestion-label {
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.accept-suggestion,
+.btn-confirm {
+  background: rgba(27, 103, 95, 0.94);
+  color: #fff8ef;
+}
+
+.btn-reject {
+  background: rgba(197, 83, 66, 0.94);
+  color: #fff8ef;
+}
+
+.label-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 10px;
+}
+
+.label-row input {
+  min-height: 44px;
+  border-radius: 14px;
+  border: 1px solid rgba(26, 37, 29, 0.12);
+  background: rgba(255, 252, 247, 0.96);
+  padding: 0 14px;
+  color: var(--ink);
+}
+
+.current-label {
+  border-radius: 16px;
+  padding: 12px 14px;
+}
+
+.current-label.confirmed {
+  background: rgba(27, 103, 95, 0.12);
+  color: #164b45;
+}
+
+.current-label.rejected {
+  background: rgba(197, 83, 66, 0.12);
+  color: #7f2f24;
+}
+
+.toast-banner {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 1200;
+  min-width: 260px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(25, 59, 54, 0.94);
+  color: #fff8ee;
+  box-shadow: var(--shadow);
+}
+
+@media (max-width: 1180px) {
+  .stats-grid,
+  .lab-stats-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .hero-panel,
-  .lane-grid {
+  .lane-grid,
+  .lab-layout {
     grid-template-columns: 1fr;
   }
 }
 
-@media (max-width: 760px) {
+@media (max-width: 780px) {
   .app-shell {
-    width: min(100vw - 18px, 1480px);
+    width: min(100vw - 18px, 1500px);
     padding-top: 10px;
   }
 
-  .stats-grid {
+  .stats-grid,
+  .lab-stats-grid {
     grid-template-columns: 1fr;
   }
 
   .section-heading,
-  .identity-row {
+  .identity-row,
+  .suggestion-head {
     flex-direction: column;
     align-items: start;
+  }
+
+  .label-row {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .label-row input {
+    grid-column: 1 / -1;
   }
 }

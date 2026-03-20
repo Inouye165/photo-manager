@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
-from flask import Flask, abort, render_template, send_file, request, jsonify
+from flask import Flask, abort, render_template, send_file, send_from_directory, request, jsonify
 
 from src.detection_metadata import DetectionMetadata
 from src.identity_engine import IdentityEngine
@@ -35,6 +35,9 @@ def safe_join(directory: str, filename: str) -> str:
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max file size
+
+BASE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIST_DIR = BASE_DIR / "frontend" / "dist"
 
 # Security: Define allowed image extensions
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".heic", ".heif"}
@@ -95,6 +98,19 @@ def format_size(size_bytes: int) -> str:
 def to_web_path(path: str) -> str:
     """Normalize filesystem-relative paths for use in URLs."""
     return path.replace("\\", "/") if path else path
+
+
+def frontend_build_exists() -> bool:
+    """Return True when a production React build is available."""
+    return (FRONTEND_DIST_DIR / "index.html").exists()
+
+
+def serve_frontend_shell():
+    """Serve the built React application shell."""
+    index_file = FRONTEND_DIST_DIR / "index.html"
+    if not index_file.exists():
+        abort(404)
+    return send_file(index_file)
 
 
 def get_image_files(directory: str) -> List[Dict[str, str]]:
@@ -377,6 +393,71 @@ def build_dashboard_payload(input_dir: str, output_dir: str) -> Dict[str, object
     }
 
 
+def build_lab_payload(output_dir: str) -> Dict[str, object]:
+    """Create a frontend-friendly snapshot of label-lab data."""
+    metadata_manager = DetectionMetadata(output_dir)
+    label_manager = LabelManager(output_dir)
+    identity_engine = IdentityEngine(output_dir)
+    prototypes = identity_engine.build_index(label_manager)
+
+    detections_with_labels = []
+    detection_records = metadata_manager.get_images_with_detections()
+
+    for record in detection_records:
+        image_rel_path = record["image_path"]
+        detections = record["detections"]
+
+        existing_labels = label_manager.get_labels_for_image(os.path.join(output_dir, image_rel_path))
+        existing_labels_by_index = {label["detection_index"]: label for label in existing_labels}
+
+        for index, detection in enumerate(detections):
+            existing_label = existing_labels_by_index.get(index)
+            detection_info = {
+                "image_path": to_web_path(image_rel_path),
+                "detection_index": index,
+                "detected_class": detection["class_name"],
+                "confidence": detection["confidence"],
+                "bbox": detection["bbox"],
+                "bbox_area": detection.get("bbox_area", 0),
+                "crop_path": to_web_path(detection.get("crop_path")),
+                "status": existing_label["status"] if existing_label else "pending",
+                "assigned_label": existing_label["assigned_label"] if existing_label else None,
+                "label_id": existing_label["id"] if existing_label else None,
+                "suggestion": None,
+            }
+
+            if not existing_label:
+                detection_info["suggestion"] = identity_engine.suggest_from_prototypes(detection_info, prototypes)
+
+            detections_with_labels.append(detection_info)
+
+    detections_with_labels.sort(
+        key=lambda detection: (
+            0 if detection["status"] == "pending" else 1,
+            0 if detection.get("suggestion") else 1,
+            -detection["confidence"],
+            -detection.get("bbox_area", 0),
+        )
+    )
+
+    identity_collections = build_identity_collections(label_manager)
+    lab_insights = build_lab_insights(detections_with_labels, identity_collections)
+
+    stats = label_manager.get_label_statistics()
+    stats["total_detections"] = len(detections_with_labels)
+    stats["pending_labels"] = sum(1 for detection in detections_with_labels if detection["status"] == "pending")
+    stats["identity_collections"] = len(identity_collections)
+    stats["ready_identities"] = lab_insights["ready_identities"]
+
+    return {
+        "detections": detections_with_labels,
+        "stats": stats,
+        "quick_labels": stats["unique_assigned_labels"],
+        "identity_collections": identity_collections,
+        "lab_insights": lab_insights,
+    }
+
+
 @app.route("/")
 def index():
     """Main page - show image categories"""
@@ -393,6 +474,9 @@ def index():
     # Security: validate paths
     if not is_safe_path(os.getcwd(), input_dir) or not is_safe_path(os.getcwd(), output_dir):
         return "Error: Invalid directory paths", 400
+
+    if frontend_build_exists():
+        return serve_frontend_shell()
 
     categories = organize_images_by_category(output_dir)
     label_manager = LabelManager(output_dir)
@@ -420,6 +504,44 @@ def dashboard_api():
         return jsonify({"error": "Invalid directory paths"}), 400
 
     return jsonify(build_dashboard_payload(input_dir, output_dir))
+
+
+@app.route("/lab")
+def react_lab():
+    """Serve the React app at the lab route when available."""
+    if frontend_build_exists():
+        return serve_frontend_shell()
+    return label_page()
+
+
+@app.route("/api/lab")
+def lab_api():
+    """JSON payload for the React frontend lab view."""
+    if len(sys.argv) < 3:
+        return jsonify({"error": "Missing directory arguments"}), 400
+
+    output_dir = sys.argv[2]
+
+    if not is_safe_path(os.getcwd(), output_dir):
+        return jsonify({"error": "Invalid directory paths"}), 400
+
+    return jsonify(build_lab_payload(output_dir))
+
+
+@app.route("/assets/<path:filename>")
+def frontend_assets(filename):
+    """Serve built frontend assets."""
+    if not frontend_build_exists():
+        abort(404)
+    return send_from_directory(FRONTEND_DIST_DIR / "assets", filename)
+
+
+@app.route("/favicon.svg")
+def frontend_favicon():
+    """Serve frontend favicon when present."""
+    if not frontend_build_exists():
+        abort(404)
+    return send_from_directory(FRONTEND_DIST_DIR, "favicon.svg")
 
 
 @app.route("/image/<path:filename>")
@@ -514,76 +636,18 @@ def label_page():
     if not is_safe_path(os.getcwd(), output_dir):
         return "Error: Invalid directory paths", 400
 
-    # Initialize managers
-    metadata_manager = DetectionMetadata(output_dir)
-    label_manager = LabelManager(output_dir)
-    identity_engine = IdentityEngine(output_dir)
-    prototypes = identity_engine.build_index(label_manager)
+    if frontend_build_exists():
+        return serve_frontend_shell()
 
-    # Get all detections with labels
-    detections_with_labels = []
-    
-    # Detection metadata already contains only labelable subjects from the processing pipeline.
-    detection_records = metadata_manager.get_images_with_detections()
-    
-    for record in detection_records:
-        image_rel_path = record["image_path"]
-        detections = record["detections"]
-        
-        # Get existing labels for this image
-        existing_labels = label_manager.get_labels_for_image(os.path.join(output_dir, image_rel_path))
-        existing_labels_by_index = {label["detection_index"]: label for label in existing_labels}
-        
-        for i, detection in enumerate(detections):
-            # Check if this detection already has a label
-            existing_label = existing_labels_by_index.get(i)
-            
-            detection_info = {
-                "image_path": to_web_path(image_rel_path),
-                "detection_index": i,
-                "detected_class": detection["class_name"],
-                "confidence": detection["confidence"],
-                "bbox": detection["bbox"],
-                "bbox_area": detection.get("bbox_area", 0),
-                "crop_path": to_web_path(detection.get("crop_path")),
-                "status": existing_label["status"] if existing_label else "pending",
-                "assigned_label": existing_label["assigned_label"] if existing_label else None,
-                "label_id": existing_label["id"] if existing_label else None,
-                "suggestion": None,
-            }
+    lab_payload = build_lab_payload(output_dir)
 
-            if not existing_label:
-                suggestion = identity_engine.suggest_from_prototypes(detection_info, prototypes)
-                detection_info["suggestion"] = suggestion
-            
-            detections_with_labels.append(detection_info)
-    
-    detections_with_labels.sort(
-        key=lambda detection: (
-            0 if detection["status"] == "pending" else 1,
-            0 if detection.get("suggestion") else 1,
-            -detection["confidence"],
-            -detection.get("bbox_area", 0),
-        )
-    )
-
-    identity_collections = build_identity_collections(label_manager)
-    lab_insights = build_lab_insights(detections_with_labels, identity_collections)
-
-    # Get statistics
-    stats = label_manager.get_label_statistics()
-    stats["total_detections"] = len(detections_with_labels)
-    stats["pending_labels"] = sum(1 for d in detections_with_labels if d["status"] == "pending")
-    stats["identity_collections"] = len(identity_collections)
-    stats["ready_identities"] = lab_insights["ready_identities"]
-    
     return render_template(
         "label.html",
-        detections=detections_with_labels,
-        stats=stats,
-        quick_labels=stats["unique_assigned_labels"],
-        identity_collections=identity_collections,
-        lab_insights=lab_insights,
+        detections=lab_payload["detections"],
+        stats=lab_payload["stats"],
+        quick_labels=lab_payload["quick_labels"],
+        identity_collections=lab_payload["identity_collections"],
+        lab_insights=lab_payload["lab_insights"],
     )
 
 

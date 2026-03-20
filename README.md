@@ -1,6 +1,6 @@
 # PhotoFinder
 
-AI-powered photo organization with person and animal detection, featuring debug annotations, labeling workflow, and a web UI for easy visualization.
+AI-powered photo organization with person and animal detection, featuring debug annotations, incremental labeling, a Flask backend, and a React frontend for atlas and lab views.
 
 ## Features
 
@@ -19,8 +19,9 @@ This project follows Google's engineering best practices with a modular architec
 - `src/`: Contains core logic (`ImageProcessor`, `DetectionMetadata`, `LabelManager` classes)
 - `tests/`: Contains PyTest test cases with mocking
 - `main.py`: Command-line photo processing with crop generation
-- `web_ui.py`: Flask-based web interface with labeling workflow
-- `templates/`: HTML templates for web UI and labeling interface
+- `web_ui.py`: Flask backend serving APIs, image routes, and the built React frontend
+- `frontend/`: React + Vite frontend for the Identity Atlas and Identity Lab
+- `templates/`: Legacy server-rendered templates kept as a fallback during migration
 - `train_identity_model.py`: Training pipeline stub for identity recognition models
 - `run_pipeline.py`: Complete pipeline runner
 
@@ -61,12 +62,52 @@ pip install -r requirements.txt
 ### Quick Start (Recommended)
 
 ```bash
-# Run the complete pipeline (processing + web UI)
-python run_pipeline.py <input_directory> <output_directory>
+# 1. Process photos and generate detections
+python main.py <input_directory> <output_directory>
 
 # Example:
-python run_pipeline.py ./working_dir ./sorted_output
+python main.py ./working_dir ./working_dir
+
+# 2. Build the React frontend
+cd frontend
+npm install
+npm run build
+cd ..
+
+# 3. Start the unified app
+python web_ui.py ./working_dir ./working_dir
 ```
+
+### Development Modes
+
+#### Unified Production-Like Mode
+
+```bash
+cd frontend
+npm run build
+cd ..
+python web_ui.py ./working_dir ./working_dir
+```
+
+Flask serves:
+- `/` → React Identity Atlas
+- `/lab` → React Identity Lab
+- `/api/dashboard` → Atlas JSON data
+- `/api/lab` → Lab JSON data
+
+#### Split Development Mode
+
+```bash
+# Terminal 1
+python web_ui.py ./working_dir ./working_dir
+
+# Terminal 2
+cd frontend
+npm install
+npm run dev
+```
+
+The Vite dev server proxies `/api`, `/image`, and `/working_dir` requests to Flask.
 
 ### Individual Components
 
@@ -77,10 +118,14 @@ python main.py <input_directory> <output_directory>
 # Example:
 python main.py ./working_dir ./sorted_output
 
-# 2. Start the web UI separately
+# 2. Start the Flask backend separately
 python web_ui.py <input_directory> <output_directory>
 
-# 3. Run tests
+# 3. Start the React frontend in development
+cd frontend
+npm run dev
+
+# 4. Run tests
 python -m pytest tests/ -v
 ```
 
@@ -115,13 +160,22 @@ This generates:
 - Debug annotations for verification
 
 ### 2. Label Detections
-Access the web UI and click "🏷️ Label Detections" to:
+Access the React Identity Lab at `/lab` to:
 - Review detected people and animals
 - Assign names (e.g., "Ron", "Dobby", "Hazel")
 - Confirm or reject detections
 - Filter by status, class, or assigned label
+- Accept likely-name suggestions from the lightweight identity engine
+- Build named folders incrementally in `_sorted_by_name/`
 
-### 3. Prepare Training Data
+### 3. Browse Named Collections
+Access the React Identity Atlas at `/` to:
+- See named identity cards with progress stages
+- Track which identities are warming up or stabilizing
+- Browse people, animals, and mixed-scene lanes
+- Jump back into the lab to continue strengthening weak identities
+
+### 4. Prepare Training Data
 ```bash
 python train_identity_model.py <output_directory>
 ```
