@@ -8,12 +8,14 @@ Thumbs.db
 
 # Local data and generated outputs
 working_dir/
+working_dir__source_originals/
 working_dir__mirror_workspace/
 .server.pid
 server.log
 extract_pictures.log
 debug_output*.txt
 test_out*.txt
+tmp_upload_*.jpg
 
 # Downloaded model weights
 yolov8m.pt

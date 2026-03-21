@@ -38,6 +38,17 @@ class StubImageProcessor:
         return True
 
 
+class CountingImageProcessor(StubImageProcessor):
+    """Track how many times the ingest pipeline reprocesses the same asset."""
+
+    def __init__(self):
+        self.detect_calls = 0
+
+    def detect_subjects(self, image_path):
+        self.detect_calls += 1
+        return super().detect_subjects(image_path)
+
+
 class TestIngestManager(unittest.TestCase):
     """Verify ingest persistence, duplicate detection, and file protections."""
 
@@ -70,3 +81,58 @@ class TestIngestManager(unittest.TestCase):
             self.assertTrue(result_two.duplicate)
             self.assertEqual(result_one.sha256, result_two.sha256)
             self.assertEqual(result_one.source_path, result_two.source_path)
+            self.assertEqual(result_two.duplicate_source_filename, result_one.clean_name)
+            self.assertEqual(result_two.duplicate_source_relative_path, result_one.source_relative_path)
+
+    def test_ingest_uploads_processes_multiple_files(self):
+        """Bulk ingest should run each selected file through the same single-file pipeline."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / 'source_originals'
+            processing_root = root / 'processing'
+            mirror = MirrorManager(MirrorConfig(source_originals=source_dir, mirror_workspace=root / 'mirror_workspace'))
+            manager = IngestManager(
+                IngestConfig(source_originals=source_dir, processing_root=processing_root),
+                mirror,
+                image_processor=StubImageProcessor(),
+            )
+
+            uploads = [
+                image_bytes_to_upload('alpha.jpg', Image.new('RGB', (64, 64), color=(255, 0, 0))),
+                image_bytes_to_upload('beta.jpg', Image.new('RGB', (64, 64), color=(0, 255, 0))),
+            ]
+
+            results = manager.ingest_uploads(uploads)
+
+            self.assertEqual(len(results), 2)
+            self.assertEqual(sum(result.detection_count for result in results), 2)
+            self.assertTrue(all(result.source_path.exists() for result in results))
+            self.assertTrue(all(result.canonical_path.exists() for result in results))
+
+    def test_duplicate_upload_reuses_existing_processing_artifacts(self):
+        """Duplicate bytes should be recognized by hash and should not rerun detection."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / 'source_originals'
+            processing_root = root / 'processing'
+            image_processor = CountingImageProcessor()
+            mirror = MirrorManager(MirrorConfig(source_originals=source_dir, mirror_workspace=root / 'mirror_workspace'))
+            manager = IngestManager(
+                IngestConfig(source_originals=source_dir, processing_root=processing_root),
+                mirror,
+                image_processor=image_processor,
+            )
+
+            first_upload = image_bytes_to_upload('alpha.jpg', Image.new('RGB', (64, 64), color=(10, 20, 30)))
+            second_upload = image_bytes_to_upload('renamed-copy.jpg', Image.new('RGB', (64, 64), color=(10, 20, 30)))
+
+            result_one = manager.ingest_upload(first_upload)
+            result_two = manager.ingest_upload(second_upload)
+
+            self.assertFalse(result_one.duplicate)
+            self.assertTrue(result_two.duplicate)
+            self.assertEqual(result_one.sha256, result_two.sha256)
+            self.assertEqual(result_two.duplicate_source_filename, result_one.clean_name)
+            self.assertEqual(image_processor.detect_calls, 1)

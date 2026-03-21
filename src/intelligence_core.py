@@ -38,8 +38,12 @@ try:
         Distance,
         FieldCondition,
         Filter,
+        HnswConfigDiff,
         MatchValue,
+        OptimizersConfigDiff,
+        PayloadSchemaType,
         PointStruct,
+        SearchParams,
         VectorParams,
     )
 except ImportError:  # pragma: no cover - optional at runtime
@@ -47,8 +51,12 @@ except ImportError:  # pragma: no cover - optional at runtime
     Distance = None
     FieldCondition = None
     Filter = None
+    HnswConfigDiff = None
     MatchValue = None
+    OptimizersConfigDiff = None
+    PayloadSchemaType = None
     PointStruct = None
+    SearchParams = None
     VectorParams = None
 
 
@@ -71,11 +79,18 @@ class VectorStoreConfig(BaseModel):
     """
 
     provider: Literal["in_memory", "qdrant"] = "in_memory"
-    collection_name: str = "photofinder_embeddings"
+    collection_name: str = "photo_features"
     location: Optional[Path] = None
     host: Optional[str] = None
     port: Optional[int] = Field(default=6333, ge=1)
     distance: Literal["cosine"] = "cosine"
+    hnsw_m: int = Field(default=32, ge=8, le=128)
+    hnsw_ef_construct: int = Field(default=256, ge=32, le=4096)
+    hnsw_ef_search: int = Field(default=256, ge=16, le=4096)
+    hnsw_max_indexing_threads: int = Field(default=0, ge=0, le=64)
+    optimizer_indexing_threshold: int = Field(default=0, ge=0)
+    optimizer_max_threads: int = Field(default=0, ge=0, le=64)
+    on_disk_payload: bool = True
 
     @field_validator("location", mode="before")
     @classmethod
@@ -133,6 +148,7 @@ class EmbeddingRecord(BaseModel):
     vector: list[float]
     source_asset_id: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    record_status: Literal["pending", "confirmed", "rejected"] = "confirmed"
     human_verified: bool = True
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -159,6 +175,7 @@ class SearchHit(BaseModel):
     class_name: Optional[str] = None
     score: float
     relative_path: str
+    record_status: Literal["pending", "confirmed", "rejected"] = "confirmed"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -204,8 +221,14 @@ class VectorIndex(Protocol):
         subject_type: Optional[str],
         top_k: int,
         class_name: Optional[str] = None,
+        confirmed_only: bool = True,
     ) -> list[SearchHit]:
         """Return the highest scoring matches for the provided query vector."""
+
+        raise NotImplementedError
+
+    def close(self) -> None:
+        """Release any underlying resources held by the vector backend."""
 
         raise NotImplementedError
 
@@ -229,6 +252,7 @@ class InMemoryVectorIndex:
         subject_type: Optional[str],
         top_k: int,
         class_name: Optional[str] = None,
+        confirmed_only: bool = True,
     ) -> list[SearchHit]:
         """Return the top cosine matches from the in-memory positive index."""
 
@@ -236,6 +260,9 @@ class InMemoryVectorIndex:
         hits: list[SearchHit] = []
 
         for record in self._records.values():
+            if confirmed_only and record.record_status != "confirmed":
+                continue
+
             if (
                 subject_type
                 and record.subject_type != subject_type
@@ -256,12 +283,18 @@ class InMemoryVectorIndex:
                     class_name=record.class_name,
                     score=max(-1.0, min(1.0, score)),
                     relative_path=record.relative_path,
+                    record_status=record.record_status,
                     metadata=record.metadata,
                 )
             )
 
         hits.sort(key=lambda item: item.score, reverse=True)
         return hits[:top_k]
+
+    def close(self) -> None:
+        """Release in-memory index resources."""
+
+        return None
 
 
 class InMemoryNegativeIndex:
@@ -333,6 +366,9 @@ class QdrantVectorIndex:
             or VectorParams is None
             or PointStruct is None
             or Distance is None
+            or HnswConfigDiff is None
+            or OptimizersConfigDiff is None
+            or SearchParams is None
         ):
             raise RuntimeError(
                 "qdrant-client is not installed; use provider='in_memory' "
@@ -340,33 +376,103 @@ class QdrantVectorIndex:
             )
 
         store_config = config.vector_store
+        self.is_local = store_config.location is not None
         if store_config.location is not None:
-            self.client = QdrantClient(path=str(store_config.location))
+            store_config.location.mkdir(parents=True, exist_ok=True)
+            self.client = QdrantClient(
+                path=str(store_config.location),
+                force_disable_check_same_thread=True,
+            )
         else:
             self.client = QdrantClient(host=store_config.host, port=store_config.port)
 
         self.collection_name = store_config.collection_name
-        collections = {item.name for item in self.client.get_collections().collections}
-        if self.collection_name not in collections:
+        self.search_params = SearchParams(
+            hnsw_ef=store_config.hnsw_ef_search,
+            exact=False,
+            indexed_only=False,
+        )
+        if not self.client.collection_exists(self.collection_name):
             self.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(
                     size=config.backbone.expected_embedding_dim,
                     distance=Distance.COSINE,
                 ),
+                on_disk_payload=store_config.on_disk_payload,
+                hnsw_config=HnswConfigDiff(
+                    m=store_config.hnsw_m,
+                    ef_construct=store_config.hnsw_ef_construct,
+                    max_indexing_threads=store_config.hnsw_max_indexing_threads,
+                    on_disk=True,
+                ),
+                optimizers_config=OptimizersConfigDiff(
+                    indexing_threshold=store_config.optimizer_indexing_threshold,
+                    max_optimization_threads=store_config.optimizer_max_threads,
+                ),
+            )
+        else:
+            self.client.update_collection(
+                collection_name=self.collection_name,
+                hnsw_config=HnswConfigDiff(
+                    m=store_config.hnsw_m,
+                    ef_construct=store_config.hnsw_ef_construct,
+                    max_indexing_threads=store_config.hnsw_max_indexing_threads,
+                    on_disk=True,
+                ),
+                optimizers_config=OptimizersConfigDiff(
+                    indexing_threshold=store_config.optimizer_indexing_threshold,
+                    max_optimization_threads=store_config.optimizer_max_threads,
+                ),
+            )
+
+        self._ensure_payload_indexes()
+
+    def _ensure_payload_indexes(self) -> None:
+        """Create payload indexes used by filtered search and diagnostics."""
+
+        if PayloadSchemaType is None or self.is_local:
+            return
+
+        for field_name in (
+            "identity_label",
+            "subject_type",
+            "class_name",
+            "record_status",
+            "file_hash",
+        ):
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name=field_name,
+                field_schema=PayloadSchemaType.KEYWORD,
+                wait=True,
             )
 
     def upsert(self, record: EmbeddingRecord) -> None:
         """Insert or replace one positive embedding record in Qdrant."""
 
+        file_hash = record.source_asset_id or str(record.metadata.get("file_hash") or "").strip() or None
+        confidence = record.metadata.get("confidence")
         payload = {
+            "name": record.identity_label,
+            "record_id": record.record_id,
             "identity_label": record.identity_label,
             "relative_path": record.relative_path,
             "subject_type": record.subject_type,
             "class_name": record.class_name,
+            "record_status": record.record_status,
+            "file_hash": file_hash,
+            "confidence": confidence,
+            "source_asset_id": record.source_asset_id,
+            "human_verified": record.human_verified,
+            "created_at": record.created_at,
             "metadata": record.metadata,
         }
-        point = PointStruct(id=record.record_id, vector=record.vector, payload=payload)
+        point = PointStruct(
+            id=_qdrant_point_id(record.record_id),
+            vector=record.vector,
+            payload=payload,
+        )
         self.client.upsert(collection_name=self.collection_name, points=[point], wait=True)
 
     def query(
@@ -375,6 +481,7 @@ class QdrantVectorIndex:
         subject_type: Optional[str],
         top_k: int,
         class_name: Optional[str] = None,
+        confirmed_only: bool = True,
     ) -> list[SearchHit]:
         """Return the top vector matches from the configured Qdrant collection."""
 
@@ -396,6 +503,13 @@ class QdrantVectorIndex:
                     match=MatchValue(value=class_name),
                 )
             )
+        if confirmed_only:
+            filter_rules.append(
+                FieldCondition(
+                    key="record_status",
+                    match=MatchValue(value="confirmed"),
+                )
+            )
 
         query_filter = Filter(must=filter_rules) if filter_rules else None
         response = self.client.query_points(
@@ -403,24 +517,31 @@ class QdrantVectorIndex:
             query=list(vector),
             limit=top_k,
             query_filter=query_filter,
+            search_params=self.search_params,
             with_payload=True,
-        )
+        ).points
 
         results: list[SearchHit] = []
-        for point in response.points:
+        for point in response:
             payload = point.payload or {}
             results.append(
                 SearchHit(
-                    record_id=str(point.id),
-                    identity_label=str(payload.get("identity_label", "")),
+                    record_id=str(payload.get("record_id") or point.id),
+                    identity_label=str(payload.get("name", payload.get("identity_label", ""))),
                     subject_type=str(payload.get("subject_type", subject_type)),
                     class_name=str(payload.get("class_name", "")) or None,
                     score=float(point.score),
                     relative_path=str(payload.get("relative_path", "")),
+                    record_status=str(payload.get("record_status", "confirmed")),
                     metadata=dict(payload.get("metadata", {})),
                 )
             )
         return results
+
+    def close(self) -> None:
+        """Release the underlying Qdrant client."""
+
+        self.client.close()
 
 
 class IntelligenceCore:
@@ -677,8 +798,9 @@ class IntelligenceCore:
         schedule_fine_tune: Optional[bool] = None,
         class_name: Optional[str] = None,
         record_id: Optional[str] = None,
+        record_status: Literal["pending", "confirmed", "rejected"] = "confirmed",
     ) -> EmbeddingRecord:
-        """Immediately update the live vector index after a confirmed label."""
+        """Upsert one detection embedding into the live vector index."""
         vector = (
             list(_normalize_vector(np.asarray(embedding, dtype=np.float32)))
             if embedding is not None
@@ -698,12 +820,20 @@ class IntelligenceCore:
             vector=vector,
             source_asset_id=source_asset_id,
             metadata=metadata or {},
+            record_status=record_status,
             human_verified=human_verified,
         )
         self.vector_index.upsert(record)
+        record_metadata = dict(record.metadata)
         self._log_event(
             "vector_upsert",
-            {"record_id": record.record_id, "identity_label": identity_label},
+            {
+                "record_id": record.record_id,
+                "identity_label": identity_label,
+                "record_status": record_status,
+                "file_hash": record.source_asset_id or record_metadata.get("file_hash"),
+                "confidence": record_metadata.get("confidence"),
+            },
         )
 
         should_schedule = (
@@ -793,6 +923,7 @@ class IntelligenceCore:
             subject_type=subject_type,
             top_k=candidate_limit,
             class_name=class_name,
+            confirmed_only=True,
         )
         hits = self._apply_negative_penalties(vector, hits, class_name=class_name)
         return self._build_verification_task(
@@ -854,6 +985,7 @@ class IntelligenceCore:
             subject_type=subject_type,
             top_k=candidate_limit,
             class_name=class_name,
+            confirmed_only=True,
         )
         hits = self._apply_negative_penalties(vector, hits, class_name=class_name)
         return hits[: (top_k or self.config.active_learning.top_k)]
@@ -887,6 +1019,7 @@ class IntelligenceCore:
                     class_name=hit.class_name,
                     score=adjusted_score,
                     relative_path=hit.relative_path,
+                    record_status=hit.record_status,
                     metadata={**hit.metadata, "negative_penalty": penalty},
                 )
             )
@@ -999,6 +1132,12 @@ class IntelligenceCore:
 
         temp_path.replace(log_path)
 
+    def close(self) -> None:
+        """Release runtime resources held by the active-learning engine."""
+
+        self.vector_index.close()
+        self.executor.shutdown(wait=False)
+
 
 def _normalize_vector(vector: np.ndarray) -> np.ndarray:
     """Return a float32 vector with unit norm when possible."""
@@ -1016,3 +1155,9 @@ def _score_to_confidence(score: float) -> float:
     if bounded < 0.35:
         return 0.0
     return float(1.0 / (1.0 + math.exp(-24.0 * (bounded - 0.78))))
+
+
+def _qdrant_point_id(record_id: str) -> str:
+    """Convert application record ids into valid, deterministic Qdrant point ids."""
+
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, str(record_id)))

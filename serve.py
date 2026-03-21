@@ -7,6 +7,8 @@ import sys
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
+from src.runtime_paths import resolve_runtime_directories
+
 
 def main():
     input_dir = os.environ.get("PHOTOFINDER_INPUT", "working_dir")
@@ -20,8 +22,10 @@ def main():
             print(f"Error: directory '{d}' does not exist.")
             sys.exit(1)
 
+    runtime_dirs = resolve_runtime_directories(input_dir, output_dir)
+
     # web_ui.py reads sys.argv inside route handlers
-    sys.argv = ["serve.py", input_dir, output_dir]
+    sys.argv = ["serve.py", str(runtime_dirs.source_dir), str(runtime_dirs.data_dir)]
 
     from web_ui import app  # noqa: E402  — import after argv is set
 
@@ -30,8 +34,12 @@ def main():
 
         print(f"PhotoFinder ready -> http://{host}:{port}")
         print(f"  Server:  waitress ({threads} threads)")
-        print(f"  Input:   {os.path.abspath(input_dir)}")
-        print(f"  Output:  {os.path.abspath(output_dir)}")
+        print(f"  Source:  {runtime_dirs.source_dir}")
+        print(f"  Output:  {runtime_dirs.data_dir}")
+        if runtime_dirs.legacy_source_mode:
+            print("  Mode:    legacy single-folder startup detected; uploads redirected into a separate source vault")
+            if runtime_dirs.migrated_files:
+                print(f"  Migrated legacy root photos: {len(runtime_dirs.migrated_files)}")
         serve(app, host=host, port=port, threads=threads)
     except ImportError:
         print("waitress not installed -- falling back to Flask dev server (1 thread)")

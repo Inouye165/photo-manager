@@ -8,6 +8,7 @@ import numpy as np
 
 from src.intelligence_core import (
     ActiveLearningConfig,
+    BackboneConfig,
     IntelligenceConfig,
     IntelligenceCore,
     VectorStoreConfig,
@@ -236,3 +237,101 @@ class TestIntelligenceCore(unittest.TestCase):
 
             self.assertEqual(task.proposed_label, "Sawyer")
             self.assertGreater(task.hits[0].score, task.hits[1].score)
+
+    def test_pending_records_are_hidden_from_confirmed_queries(self):
+        """Fresh ingest vectors can be stored without becoming candidate identities until labeled."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            core = IntelligenceCore(
+                IntelligenceConfig(
+                    workspace_root=workspace,
+                    vector_store=VectorStoreConfig(provider="in_memory"),
+                    active_learning=ActiveLearningConfig(schedule_fine_tune=False, top_k=3),
+                )
+            )
+
+            core.learn_from_label(
+                record_id="pending-dog-1",
+                relative_path="working_dir/pending-dog-1#0",
+                image_path=None,
+                identity_label="__pending__::working_dir/pending-dog-1#0",
+                subject_type="dog",
+                class_name="dog",
+                embedding=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+                schedule_fine_tune=False,
+                human_verified=False,
+                record_status="pending",
+            )
+
+            confirmed_hits = core.vector_index.query(
+                np.array([1.0, 0.0, 0.0], dtype=np.float32),
+                subject_type="dog",
+                top_k=5,
+                class_name="dog",
+            )
+            all_hits = core.vector_index.query(
+                np.array([1.0, 0.0, 0.0], dtype=np.float32),
+                subject_type="dog",
+                top_k=5,
+                class_name="dog",
+                confirmed_only=False,
+            )
+
+            self.assertEqual(confirmed_hits, [])
+            self.assertEqual(len(all_hits), 1)
+            self.assertEqual(all_hits[0].record_status, "pending")
+
+    def test_qdrant_local_persists_across_core_restarts(self):
+        """Confirmed embeddings stored in local Qdrant should survive a fresh IntelligenceCore instance."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            vector_db_path = workspace / "vector_db"
+            embedding = np.zeros(128, dtype=np.float32)
+            embedding[0] = 1.0
+            config = IntelligenceConfig(
+                workspace_root=workspace / "active_learning",
+                backbone=BackboneConfig(expected_embedding_dim=128),
+                vector_store=VectorStoreConfig(
+                    provider="qdrant",
+                    location=vector_db_path,
+                    collection_name="photo_features_test",
+                ),
+                active_learning=ActiveLearningConfig(schedule_fine_tune=False, top_k=3),
+            )
+
+            first_core = None
+            second_core = None
+            try:
+                first_core = IntelligenceCore(config)
+                first_core.learn_from_label(
+                    record_id="persisted-person-1",
+                    relative_path="working_dir/persisted-person-1#0",
+                    image_path=None,
+                    identity_label="Ron",
+                    subject_type="person",
+                    class_name="person",
+                    embedding=embedding,
+                    source_asset_id="abc123hash",
+                    metadata={"confidence": 0.98, "file_hash": "abc123hash"},
+                    schedule_fine_tune=False,
+                )
+                first_core.close()
+                first_core = None
+
+                second_core = IntelligenceCore(config)
+                task = second_core.propose_identity(
+                    relative_path="working_dir/query#0",
+                    subject_type="person",
+                    class_name="person",
+                    embedding=embedding,
+                )
+
+                self.assertEqual(task.proposed_label, "Ron")
+                self.assertEqual(task.hits[0].metadata.get("file_hash"), "abc123hash")
+            finally:
+                if first_core is not None:
+                    first_core.close()
+                if second_core is not None:
+                    second_core.close()
