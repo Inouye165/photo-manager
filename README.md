@@ -101,6 +101,33 @@ cd ..
 python web_ui.py ./working_dir ./working_dir
 ```
 
+If you start the app in legacy single-folder mode with the same directory for both
+arguments, PhotoFinder now auto-creates a dedicated immutable source vault beside
+that folder, for example `working_dir__source_originals`. Existing root photos are
+backfilled into that vault once, and all future uploads go there instead of mixing
+new originals with generated artifacts.
+
+### Source Vault And Duplicate Policy
+
+- Every uploaded file is hashed with SHA-256 before ingest.
+- Duplicate detection is content-based, not filename-based.
+- A renamed file with identical bytes is skipped and reported as a duplicate.
+- Generated artifacts stay in the working/output directory.
+- Immutable source originals live in the source vault and are treated as read-only.
+
+The atlas now includes a small Vault Admin panel that shows:
+
+- Unique source-original count
+- Total source-vault size
+- Total upload attempts
+- Total blocked duplicate attempts by hash
+- Vault integrity status confirming originals remain unique-only
+- Recent blocked duplicate attempts, including the existing asset that caused the block
+
+On startup, PhotoFinder also re-applies read-only protection to every file already
+in the source vault. That keeps previously imported originals locked even if their
+file attributes were changed outside the app.
+
 ### Development Modes
 
 #### Unified Production-Like Mode
@@ -111,6 +138,9 @@ npm run build
 cd ..
 python web_ui.py ./working_dir ./working_dir
 ```
+
+For local convenience, the app still accepts `./working_dir ./working_dir`, but it
+will internally separate immutable source originals from generated data.
 
 Flask serves:
 - `/` → React Identity Atlas
@@ -169,6 +199,18 @@ output_directory/
 └── [other images]           # Photos without people/animals
 ```
 
+When uploads are enabled through the web UI, expect an adjacent source vault too:
+
+```
+working_dir__source_originals/
+├── IMG_20260320_abcd1234ef56.jpg
+├── IMG_20260320_9876fedcba10.heic
+└── ... immutable originals deduped by SHA-256 ...
+```
+
+That vault is the authoritative home for original uploads. The working directory is
+allowed to contain generated copies, previews, crops, labels, and detection data.
+
 ## Labeling Workflow
 
 PhotoFinder now includes a complete labeling workflow for identity recognition:
@@ -210,7 +252,7 @@ This creates a structured dataset for model training and provides:
 ## Web UI Categories
 
 The web interface organizes photos into:
-- **Working Directory**: Original input images
+- **Working Directory**: Source originals surfaced from the immutable source vault
 - **People Only**: Images containing people but no animals
 - **Animals Only**: Images containing animals but no people
 - **Both**: Images containing both people and animals
@@ -290,6 +332,12 @@ results = self.yolo_model(image, verbose=False, conf=0.10)  # Debug threshold
 - Process images in batches for large collections
 - SSD storage improves I/O performance
 - Consider GPU acceleration for very large datasets
+
+### Duplicate Upload Checks
+
+- If a folder upload contains files already present in the vault, the UI reports them as blocked upload attempts.
+- Duplicate decisions are based on SHA-256 of the file bytes, not path or filename.
+- The upload result card only lists newly accepted files. Blocked attempts are summarized separately.
 
 ## Development
 

@@ -30,9 +30,40 @@ const LAB_MODES = [
 
 const EMPTY_DASHBOARD = {
   hero: { title: 'Identity Atlas', summary: 'Loading your photo memory...', momentum: null },
-  stats: { originalCount: 0, processedCount: 0, identityCount: 0, peopleSignalCount: 0, animalSignalCount: 0 },
+  stats: { originalCount: 0, processedCount: 0, identityCount: 0, peopleSignalCount: 0, animalSignalCount: 0, sourceVaultCount: 0, duplicateUploadCount: 0 },
   identityCollections: [],
   lanes: {},
+  vault: {
+    sourceDir: '',
+    sourceCount: 0,
+    uniqueHashCount: 0,
+    integrityStatus: 'clean',
+    sourceSizeBytes: 0,
+    sourceSizeLabel: '0 B',
+    uploadAttempts: 0,
+    newUploads: 0,
+    blockedDuplicateAttempts: 0,
+    lastUploadAt: null,
+    recentBlockedAttempts: [],
+    legacySourceMode: false,
+    legacyMigratedCount: 0,
+  },
+}
+
+function formatRelativeTimestamp(value) {
+  if (!value) {
+    return 'No uploads yet'
+  }
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return 'Unknown'
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(date)
 }
 
 const EMPTY_LAB = {
@@ -578,6 +609,7 @@ function AtlasView({ dashboard, loading, error, onRefresh, onToast }) {
     { label: 'Named Identities', value: dashboard.stats.identityCount, note: 'People and pets with confirmed labels.' },
     { label: 'People Signals', value: dashboard.stats.peopleSignalCount, note: 'Frames that can accelerate known-face coverage.' },
     { label: 'Animal Signals', value: dashboard.stats.animalSignalCount, note: 'Frames that can become named pet collections.' },
+    { label: 'Blocked Attempts', value: dashboard.stats.duplicateUploadCount, note: 'Uploads rejected because their file hash already exists in the vault.' },
   ]
 
   const lanes = Object.entries(dashboard.lanes || {})
@@ -616,6 +648,8 @@ function AtlasView({ dashboard, loading, error, onRefresh, onToast }) {
       {loading ? <section className="status-panel">Loading the atlas snapshot...</section> : null}
 
       <UploadPanel onUploadComplete={onRefresh} onToast={onToast} />
+
+      <VaultAdminPanel vault={dashboard.vault} />
 
       <section className="section-panel">
         <div className="section-heading">
@@ -683,6 +717,145 @@ function AtlasView({ dashboard, loading, error, onRefresh, onToast }) {
         </div>
       </section>
     </>
+  )
+}
+
+function VaultAdminPanel({ vault }) {
+  const [browserPayload, setBrowserPayload] = useState({ folders: [], sourceCount: 0, uniqueHashCount: 0, duplicateHashGroups: 0 })
+  const [browserLoading, setBrowserLoading] = useState(true)
+  const [browserError, setBrowserError] = useState('')
+
+  useEffect(() => {
+    let isActive = true
+
+    async function loadVaultBrowser() {
+      try {
+        setBrowserLoading(true)
+        const response = await fetch('/api/vault/browser')
+        if (!response.ok) {
+          throw new Error('Could not load vault browser')
+        }
+
+        const payload = await response.json()
+        if (!isActive) {
+          return
+        }
+
+        setBrowserPayload(payload)
+        setBrowserError('')
+      } catch (requestError) {
+        if (isActive) {
+          setBrowserError(requestError.message || 'Could not load vault browser')
+        }
+      } finally {
+        if (isActive) {
+          setBrowserLoading(false)
+        }
+      }
+    }
+
+    loadVaultBrowser()
+    return () => {
+      isActive = false
+    }
+  }, [])
+
+  const miniStats = [
+    { label: 'Unique originals', value: vault.sourceCount, note: vault.sourceSizeLabel },
+    { label: 'Upload attempts', value: vault.uploadAttempts, note: `${vault.newUploads} new accepted` },
+    { label: 'Blocked attempts', value: vault.blockedDuplicateAttempts, note: 'Matched by SHA-256, not filename' },
+    { label: 'Vault integrity', value: vault.integrityStatus === 'clean' ? 'Clean' : 'Check', note: `${vault.uniqueHashCount} unique hashes across ${vault.sourceCount} originals` },
+    { label: 'Legacy migration', value: vault.legacyMigratedCount, note: vault.legacySourceMode ? 'Single-folder installs were backfilled into the vault' : 'Dedicated source vault mode' },
+  ]
+
+  return (
+    <section className="section-panel compact-panel vault-panel">
+      <div className="section-heading compact-heading">
+        <div>
+          <div className="eyebrow accent">Vault Admin</div>
+          <h2>Immutable source health</h2>
+        </div>
+        <div className="vault-last-upload">Last upload: {formatRelativeTimestamp(vault.lastUploadAt)}</div>
+      </div>
+
+      <div className="vault-mini-grid">
+        {miniStats.map((card) => (
+          <article className="vault-mini-card" key={card.label}>
+            <div className="vault-mini-value">{card.value}</div>
+            <div className="vault-mini-label">{card.label}</div>
+            <div className="vault-mini-note">{card.note}</div>
+          </article>
+        ))}
+      </div>
+
+      <div className="vault-meta-row">
+        <div>
+          <strong>Source vault</strong>
+          <span>{vault.sourceDir || 'Not configured'}</span>
+        </div>
+      </div>
+
+      {vault.recentBlockedAttempts?.length ? (
+        <div className="vault-duplicates-list">
+          {vault.recentBlockedAttempts.map((item) => (
+            <div className="vault-duplicate-item" key={`${item.sha256}-${item.timestamp}`}>
+              <strong>{item.original_filename || 'Unnamed upload'}</strong>
+              <span>Blocked before ingest because the vault already contains {item.matched_filename}.</span>
+              <span className="vault-hash">{item.sha256.slice(0, 12)}...</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="empty-panel compact">No blocked duplicate attempts yet. The vault is only storing unique originals.</div>
+      )}
+
+      <div className="section-heading compact-heading">
+        <div>
+          <div className="eyebrow accent-coral">Vault Browser</div>
+          <h2>Folders, hashes, metadata, and debug boxes</h2>
+        </div>
+      </div>
+
+      {browserError ? <div className="status-panel error">{browserError}</div> : null}
+      {browserLoading ? <div className="status-panel">Loading the vault browser...</div> : null}
+
+      {!browserLoading && !browserError ? (
+        <div className="vault-folder-grid">
+          {browserPayload.folders.map((folder) => (
+            <article className="vault-folder-card" key={folder.path}>
+              <div className="vault-folder-head">
+                <div>
+                  <h3>{folder.path}</h3>
+                  <p>{folder.count} file{folder.count === 1 ? '' : 's'}</p>
+                </div>
+              </div>
+              <div className="vault-item-grid">
+                {folder.items.map((item) => (
+                  <article className="vault-item-card" key={item.relativePath}>
+                    <div className="vault-item-preview-grid">
+                      <div className="vault-item-preview">
+                        <SmartImage src={item.previewUrl} alt={item.filename} />
+                      </div>
+                      <div className="vault-item-preview debug">
+                        {item.debugUrl ? <SmartImage src={item.debugUrl} alt={`${item.filename} debug boxes`} /> : <div className="vault-preview-empty">No boxes</div>}
+                      </div>
+                    </div>
+                    <div className="vault-item-body">
+                      <strong>{item.filename}</strong>
+                      <span>{item.width} × {item.height} • {item.sizeLabel}</span>
+                      <span>SHA-256: {item.sha256}</span>
+                      <span>Detected: {item.detectedClasses?.length ? item.detectedClasses.join(', ') : 'none'} ({item.detectionCount})</span>
+                      <span>Captured: {item.capturedAt || 'unknown'}</span>
+                      <span>Original name: {item.originalFilename || item.filename}</span>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : null}
+    </section>
   )
 }
 

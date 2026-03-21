@@ -7,3 +7,4 @@ Pillow
 ultralytics
 flask
 waitress
+qdrant-client

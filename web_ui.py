@@ -7,6 +7,7 @@ Security-focused implementation with proper input validation and file access con
 import os
 import sys
 import logging
+import json
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -22,6 +23,7 @@ from flask import (
     send_file,
     send_from_directory,
 )
+from werkzeug.exceptions import RequestEntityTooLarge
 import pillow_heif
 from PIL import Image, ImageOps
 
@@ -32,6 +34,7 @@ from src.identity_engine import IdentityEngine
 from src.label_manager import LabelManager
 from src.mirror_manager import CropRequest, MirrorConfig, MirrorManager
 from src.image_processor import ImageProcessor
+from src.runtime_paths import RuntimeDirectories, resolve_runtime_directories
 
 
 def safe_join(directory: str, filename: str) -> str:
@@ -64,6 +67,7 @@ ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/bmp", "image/tiff", "ima
 LAB_PAYLOAD_CACHE: Dict[str, object] = {"key": None, "payload": None}
 IDENTITY_TASK_CACHE: Dict[str, object] = {"key": None, "payload": None}
 SERVICE_BUNDLE_CACHE: Dict[str, object] = {"key": None, "bundle": None}
+RUNTIME_DIR_CACHE: Dict[str, object] = {"key": None, "paths": None}
 WEB_VARIANTS = {
     "thumb": {"max_size": (280, 280), "quality": 60},
     "full": {"max_size": (1600, 1600), "quality": 82},
@@ -187,13 +191,39 @@ def invalidate_runtime_caches() -> None:
     IDENTITY_TASK_CACHE["payload"] = None
 
 
-def get_runtime_bundle() -> Dict[str, object]:
-    """Resolve the live source/mirror/intelligence services for this process."""
+def get_runtime_directories() -> RuntimeDirectories:
+    """Resolve CLI directories once and preserve legacy single-folder installs."""
+
     if len(sys.argv) < 3:
         raise RuntimeError("PhotoFinder requires source_originals and mirror metadata directories")
 
-    source_dir = Path(sys.argv[1]).resolve()
-    data_dir = Path(sys.argv[2]).resolve()
+    cache_key = (str(Path(sys.argv[1]).resolve()), str(Path(sys.argv[2]).resolve()))
+    if RUNTIME_DIR_CACHE["key"] == cache_key and RUNTIME_DIR_CACHE["paths"] is not None:
+        return RUNTIME_DIR_CACHE["paths"]
+
+    resolved_dirs = resolve_runtime_directories(sys.argv[1], sys.argv[2])
+    if resolved_dirs.legacy_source_mode:
+        LOGGER.warning(
+            "Legacy single-folder mode detected; using source vault %s for uploads while keeping generated data in %s",
+            resolved_dirs.source_dir,
+            resolved_dirs.data_dir,
+        )
+        if resolved_dirs.migrated_files:
+            LOGGER.info(
+                "Migrated %s legacy root photo(s) into the source vault on startup",
+                len(resolved_dirs.migrated_files),
+            )
+
+    RUNTIME_DIR_CACHE["key"] = cache_key
+    RUNTIME_DIR_CACHE["paths"] = resolved_dirs
+    return resolved_dirs
+
+
+def get_runtime_bundle() -> Dict[str, object]:
+    """Resolve the live source/mirror/intelligence services for this process."""
+    resolved_dirs = get_runtime_directories()
+    source_dir = resolved_dirs.source_dir
+    data_dir = resolved_dirs.data_dir
     browser_workspace = data_dir if source_dir != data_dir else data_dir.parent / f"{data_dir.name}__mirror_workspace"
     cache_key = (str(source_dir), str(data_dir), str(browser_workspace))
 
@@ -214,7 +244,14 @@ def get_runtime_bundle() -> Dict[str, object]:
     )
 
     intelligence_core = IntelligenceCore(
-        IntelligenceConfig(workspace_root=browser_workspace / "active_learning")
+        IntelligenceConfig(
+            workspace_root=browser_workspace / "active_learning",
+            vector_store={
+                "provider": "qdrant",
+                "location": browser_workspace / "vector_db",
+                "collection_name": "photo_features",
+            },
+        )
     )
 
     bundle = {
@@ -258,6 +295,11 @@ def build_detection_record_id(image_path: str, detection_index: int) -> str:
 def build_negative_record_id(image_path: str, detection_index: int, label: str) -> str:
     """Create a stable negative-memory id for one rejected label on one detection."""
     return f"negative::{build_detection_record_id(image_path, detection_index)}::{label.strip().lower()}"
+
+
+def build_pending_identity_label(image_path: str, detection_index: int) -> str:
+    """Create a stable placeholder label for unlabeled detections stored in the vector index."""
+    return f"__pending__::{build_detection_record_id(image_path, detection_index)}"
 
 
 def parse_date_range(value: Optional[str]) -> tuple[Optional[datetime], Optional[datetime]]:
@@ -783,6 +825,7 @@ def bootstrap_intelligence_index(
             identity_label=assigned_label,
             subject_type=subject_type,
             class_name=str(label_record.get("detected_class") or "").strip().lower() or None,
+            source_asset_id=str(image_metadata.get("file_hash") or "").strip() or None,
             metadata={
                 "preview_url": asset_payload.get("candidate_image_url"),
                 "full_url": asset_payload.get("candidate_full_url"),
@@ -790,6 +833,8 @@ def bootstrap_intelligence_index(
                 "crop_path": normalize_relative_path(label_record.get("crop_path")),
                 "label_id": label_record.get("id"),
                 "captured_at": image_metadata.get("captured_at"),
+                "file_hash": image_metadata.get("file_hash"),
+                "confidence": label_record.get("confidence") or image_metadata.get("confidence"),
             },
             human_verified=False,
             schedule_fine_tune=False,
@@ -1115,8 +1160,12 @@ def build_upload_response(result) -> Dict[str, object]:
     return {
         "success": True,
         "duplicate": result.duplicate,
+        "sha256": result.sha256,
         "clean_name": result.clean_name,
+        "original_filename": result.original_filename,
         "source_relative_path": result.source_relative_path,
+        "duplicate_source_filename": result.duplicate_source_filename,
+        "duplicate_source_relative_path": result.duplicate_source_relative_path,
         "canonical_relative_path": result.canonical_relative_path,
         "preview_url": preview_url,
         "detection_count": result.detection_count,
@@ -1126,6 +1175,275 @@ def build_upload_response(result) -> Dict[str, object]:
         "uploaded_task_count": len(matching_tasks),
         "identity_lab_url": "/identity-lab",
     }
+
+
+def build_batch_upload_response(results: List[object], failures: Optional[List[Dict[str, str]]] = None) -> Dict[str, object]:
+    """Create a summary payload for multi-file and folder uploads."""
+    item_payloads = [build_upload_response(result) for result in results]
+    failures = failures or []
+    duplicate_count = sum(1 for item in item_payloads if item.get("duplicate"))
+
+    return {
+        "count": len(item_payloads),
+        "uploaded_count": len(item_payloads) - duplicate_count,
+        "duplicate_count": duplicate_count,
+        "failure_count": len(failures),
+        "detection_count": sum(int(item.get("detection_count", 0)) for item in item_payloads),
+        "uploaded_task_count": sum(int(item.get("uploaded_task_count", 0)) for item in item_payloads),
+        "identity_lab_url": "/identity-lab",
+        "items": item_payloads,
+        "duplicate_items": [item for item in item_payloads if item.get("duplicate")],
+        "failures": failures,
+    }
+
+
+def get_upload_activity_path(browser_workspace: Path) -> Path:
+    """Return the metadata path used to persist ingest activity summaries."""
+
+    return browser_workspace / "metadata" / "upload_activity.json"
+
+
+def load_upload_activity(browser_workspace: Path) -> Dict[str, object]:
+    """Load persisted upload activity with safe defaults."""
+
+    activity_path = get_upload_activity_path(browser_workspace)
+    if not activity_path.exists():
+        return {
+            "total_upload_attempts": 0,
+            "total_new_uploads": 0,
+            "total_blocked_duplicate_attempts": 0,
+            "last_upload_at": None,
+            "recent_blocked_attempts": [],
+        }
+
+    try:
+        payload = json.loads(activity_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("Could not parse upload activity file: %s", activity_path)
+        return {
+            "total_upload_attempts": 0,
+            "total_new_uploads": 0,
+            "total_blocked_duplicate_attempts": 0,
+            "last_upload_at": None,
+            "recent_blocked_attempts": [],
+        }
+
+    payload.setdefault("total_upload_attempts", 0)
+    payload.setdefault("total_new_uploads", 0)
+    if "total_blocked_duplicate_attempts" not in payload:
+        payload["total_blocked_duplicate_attempts"] = int(payload.get("total_duplicate_uploads", 0))
+    payload.setdefault("last_upload_at", None)
+    if "recent_blocked_attempts" not in payload:
+        payload["recent_blocked_attempts"] = list(payload.get("recent_duplicates") or [])
+    return payload
+
+
+def record_upload_activity(browser_workspace: Path, result) -> Dict[str, object]:
+    """Persist aggregate upload counters and a short recent-duplicates feed."""
+
+    payload = load_upload_activity(browser_workspace)
+    payload["total_upload_attempts"] = int(payload.get("total_upload_attempts", 0)) + 1
+    if result.duplicate:
+        payload["total_blocked_duplicate_attempts"] = int(payload.get("total_blocked_duplicate_attempts", 0)) + 1
+        recent_blocked_attempts = list(payload.get("recent_blocked_attempts") or [])
+        recent_blocked_attempts.insert(
+            0,
+            {
+                "original_filename": result.original_filename,
+                "matched_filename": result.duplicate_source_filename or result.clean_name,
+                "source_relative_path": result.duplicate_source_relative_path or result.source_relative_path,
+                "sha256": result.sha256,
+                "timestamp": datetime.now().isoformat(),
+            },
+        )
+        payload["recent_blocked_attempts"] = recent_blocked_attempts[:8]
+    else:
+        payload["total_new_uploads"] = int(payload.get("total_new_uploads", 0)) + 1
+
+    payload["last_upload_at"] = datetime.now().isoformat()
+
+    activity_path = get_upload_activity_path(browser_workspace)
+    activity_path.parent.mkdir(parents=True, exist_ok=True)
+    activity_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
+def build_vault_summary() -> Dict[str, object]:
+    """Create a compact source-vault summary for the atlas admin panel."""
+
+    bundle = get_runtime_bundle()
+    resolved_dirs = get_runtime_directories()
+    report = bundle["mirror_manager"].sync_source_index()
+    activity = load_upload_activity(bundle["browser_workspace"])
+    total_size_bytes = sum(int(record.size_bytes) for record in report.records)
+    unique_hash_count = len({record.sha256 for record in report.records})
+
+    return {
+        "sourceDir": str(bundle["source_dir"]),
+        "sourceCount": len(report.records),
+        "uniqueHashCount": unique_hash_count,
+        "integrityStatus": "clean" if unique_hash_count == len(report.records) else "needs-attention",
+        "sourceSizeBytes": total_size_bytes,
+        "sourceSizeLabel": format_size(total_size_bytes),
+        "uploadAttempts": int(activity.get("total_upload_attempts", 0)),
+        "newUploads": int(activity.get("total_new_uploads", 0)),
+        "blockedDuplicateAttempts": int(activity.get("total_blocked_duplicate_attempts", 0)),
+        "lastUploadAt": activity.get("last_upload_at"),
+        "recentBlockedAttempts": activity.get("recent_blocked_attempts", []),
+        "legacySourceMode": resolved_dirs.legacy_source_mode,
+        "legacyMigratedCount": len(resolved_dirs.migrated_files),
+    }
+
+
+def build_vault_browser_payload(source_dir: str | Path, data_dir: str | Path) -> Dict[str, object]:
+    """Build a folder-oriented browser payload for immutable source originals."""
+
+    source_path = Path(source_dir).resolve()
+    data_path = Path(data_dir).resolve()
+    mirror_manager = MirrorManager(
+        MirrorConfig(
+            source_originals=source_path,
+            mirror_workspace=data_path if source_path != data_path else data_path.parent / f"{data_path.name}__mirror_workspace",
+        )
+    )
+    report = mirror_manager.sync_source_index()
+    metadata_manager = DetectionMetadata(str(data_path))
+    detection_records = metadata_manager.get_detections()
+
+    detection_by_hash: Dict[str, Dict[str, object]] = {}
+    detection_by_name: Dict[str, Dict[str, object]] = {}
+    for detection_record in detection_records.values():
+        record_metadata = dict(detection_record.get("metadata") or {})
+        file_hash = str(record_metadata.get("file_hash") or "").strip()
+        image_path = normalize_relative_path(detection_record.get("image_path"))
+        if file_hash and file_hash not in detection_by_hash:
+            detection_by_hash[file_hash] = detection_record
+        if image_path:
+            detection_by_name.setdefault(Path(image_path).name, detection_record)
+
+    folders: Dict[str, list[Dict[str, object]]] = {}
+    for record in report.records:
+        detection_record = detection_by_hash.get(record.sha256) or detection_by_name.get(Path(record.relative_path).name)
+        detections = list(detection_record.get("detections") or []) if detection_record else []
+        image_metadata = dict(detection_record.get("metadata") or {}) if detection_record else {}
+        debug_image_path = normalize_relative_path(detection_record.get("debug_image_path")) if detection_record else None
+        folder_key = Path(record.relative_path).parent.as_posix() if Path(record.relative_path).parent.as_posix() != "." else "root"
+
+        folders.setdefault(folder_key, []).append(
+            {
+                "filename": Path(record.relative_path).name,
+                "relativePath": record.relative_path,
+                "sha256": record.sha256,
+                "sha256Short": record.sha256[:12],
+                "sizeBytes": record.size_bytes,
+                "sizeLabel": format_size(record.size_bytes),
+                "width": record.width,
+                "height": record.height,
+                "mimeType": record.mime_type,
+                "capturedAt": image_metadata.get("captured_at"),
+                "originalFilename": image_metadata.get("original_filename"),
+                "detectionCount": len(detections),
+                "detectedClasses": sorted({str(detection.get("class_name") or "").strip().lower() for detection in detections if detection.get("class_name")}),
+                "debugImagePath": debug_image_path,
+                "previewUrl": f"/working_dir/{quote(record.relative_path, safe='/')}?variant=thumb",
+                "fullUrl": f"/working_dir/{quote(record.relative_path, safe='/')}?variant=full",
+                "debugUrl": f"/image/{quote(debug_image_path, safe='/')}?variant=full" if debug_image_path else None,
+                "canonicalRelativePath": normalize_relative_path(detection_record.get("image_path")) if detection_record else None,
+            }
+        )
+
+    folder_payload = [
+        {
+            "path": folder_path,
+            "count": len(items),
+            "items": sorted(items, key=lambda item: item["filename"].lower()),
+        }
+        for folder_path, items in sorted(folders.items(), key=lambda item: (item[0] != "root", item[0].lower()))
+    ]
+
+    unique_hash_count = len({record.sha256 for record in report.records})
+    return {
+        "sourceCount": len(report.records),
+        "uniqueHashCount": unique_hash_count,
+        "duplicateHashGroups": max(0, len(report.records) - unique_hash_count),
+        "folders": folder_payload,
+    }
+
+
+def upsert_detection_vector_record(
+    *,
+    image_path: str,
+    detection_index: int,
+    detection: Dict[str, object],
+    image_metadata: Dict[str, object],
+    record_status: str,
+    assigned_label: Optional[str] = None,
+) -> None:
+    """Upsert one detection crop into the live vector index using its current labeling state."""
+    bundle = get_runtime_bundle()
+    detected_class = str(detection.get("class_name") or "").strip().lower()
+    if not detected_class:
+        return
+
+    subject_type = get_subject_group(detected_class)
+    subject_lane = get_subject_lane(detected_class)
+    asset_payload = resolve_detection_asset_urls(
+        mirror_manager=bundle["mirror_manager"],
+        source_dir=bundle["source_dir"],
+        data_dir=bundle["data_dir"],
+        browser_workspace=bundle["browser_workspace"],
+        image_path=image_path,
+        crop_path=detection.get("crop_path"),
+        bbox=detection.get("bbox"),
+        subject_type=subject_lane,
+        identity_hint=assigned_label or detected_class,
+    )
+    embedding_path_value = asset_payload.get("embedding_path")
+    if not embedding_path_value:
+        return
+
+    stable_record_id = build_detection_record_id(image_path, detection_index)
+    effective_label = (assigned_label or "").strip() or build_pending_identity_label(image_path, detection_index)
+    bundle["intelligence_core"].learn_from_label(
+        record_id=stable_record_id,
+        relative_path=stable_record_id,
+        image_path=Path(embedding_path_value),
+        identity_label=effective_label,
+        subject_type=subject_type,
+        class_name=detected_class,
+        source_asset_id=str(image_metadata.get("file_hash") or "").strip() or None,
+        metadata={
+            "preview_url": asset_payload.get("candidate_image_url"),
+            "full_url": asset_payload.get("candidate_full_url"),
+            "image_path": image_path,
+            "crop_path": normalize_relative_path(detection.get("crop_path")),
+            "bbox": detection.get("bbox"),
+            "detected_class": detection.get("class_name"),
+            "captured_at": image_metadata.get("captured_at"),
+            "file_hash": image_metadata.get("file_hash"),
+            "confidence": detection.get("confidence"),
+        },
+        human_verified=record_status == "confirmed",
+        schedule_fine_tune=False,
+        record_status="confirmed" if record_status == "confirmed" else "pending" if record_status == "pending" else "rejected",
+    )
+
+
+def index_ingest_result(result) -> None:
+    """Index all detections from a fresh ingest so they are available in the live vector store."""
+    metadata_manager = DetectionMetadata(str(get_runtime_bundle()["data_dir"]))
+    detection_record = metadata_manager.get_detections(str(result.canonical_path))
+    detections = list(detection_record.get("detections") or [])
+    image_metadata = dict(detection_record.get("metadata") or {})
+
+    for detection_index, detection in enumerate(detections):
+        upsert_detection_vector_record(
+            image_path=result.canonical_relative_path,
+            detection_index=detection_index,
+            detection=detection,
+            image_metadata=image_metadata,
+            record_status="pending",
+        )
 
 
 def persist_label_update(
@@ -1197,29 +1515,25 @@ def persist_label_update(
 
     if status == "confirmed" and assigned_label:
         if embedding_path is not None:
-            bundle["intelligence_core"].learn_from_label(
-                record_id=stable_record_id,
-                relative_path=stable_record_id,
-                image_path=embedding_path,
-                identity_label=assigned_label,
-                subject_type=subject_type,
-                class_name=str(detection.get("class_name") or "").strip().lower() or None,
-                metadata={
-                    "preview_url": asset_payload.get("candidate_image_url"),
-                    "full_url": asset_payload.get("candidate_full_url"),
-                    "image_path": image_path,
-                    "crop_path": normalize_relative_path(detection.get("crop_path")),
-                    "bbox": detection.get("bbox"),
-                    "detected_class": detection.get("class_name"),
-                    "captured_at": image_metadata.get("captured_at"),
-                },
-                human_verified=True,
-                schedule_fine_tune=False,
+            upsert_detection_vector_record(
+                image_path=image_path,
+                detection_index=detection_index,
+                detection=detection,
+                image_metadata=image_metadata,
+                record_status="confirmed",
+                assigned_label=assigned_label,
             )
             bundle["intelligence_core"].remove_negative_sample(assigned_label, build_negative_record_id(image_path, detection_index, assigned_label))
         if prior_label and prior_label != assigned_label:
             bundle["intelligence_core"].remove_negative_sample(prior_label, build_negative_record_id(image_path, detection_index, prior_label))
     elif status == "rejected" and suggested_label and embedding_path is not None:
+        upsert_detection_vector_record(
+            image_path=image_path,
+            detection_index=detection_index,
+            detection=detection,
+            image_metadata=image_metadata,
+            record_status="rejected",
+        )
         bundle["intelligence_core"].add_negative_sample(
             record_id=build_negative_record_id(image_path, detection_index, suggested_label),
             relative_path=stable_record_id,
@@ -1233,6 +1547,14 @@ def persist_label_update(
                 "detected_class": detection.get("class_name"),
                 "captured_at": image_metadata.get("captured_at"),
             },
+        )
+    elif status == "pending" and embedding_path is not None:
+        upsert_detection_vector_record(
+            image_path=image_path,
+            detection_index=detection_index,
+            detection=detection,
+            image_metadata=image_metadata,
+            record_status="pending",
         )
 
     if invalidate_caches:
@@ -1347,6 +1669,7 @@ def persist_identity_decision(decision: VerificationDecision) -> Dict[str, objec
             identity_label=decision.confirmed_label,
             subject_type=decision.subject_type,
             class_name=str(detection.get("class_name") or "").strip().lower() or None,
+            source_asset_id=str(image_metadata.get("file_hash") or "").strip() or None,
             metadata={
                 "preview_url": asset_payload.get("candidate_image_url"),
                 "full_url": asset_payload.get("candidate_full_url"),
@@ -1354,6 +1677,8 @@ def persist_identity_decision(decision: VerificationDecision) -> Dict[str, objec
                 "crop_path": normalize_relative_path(detection.get("crop_path")),
                 "detected_class": detection.get("class_name"),
                 "captured_at": image_metadata.get("captured_at"),
+                "file_hash": image_metadata.get("file_hash"),
+                "confidence": detection.get("confidence"),
             },
             human_verified=True,
             schedule_fine_tune=decision.schedule_fine_tune,
@@ -1401,6 +1726,7 @@ def build_dashboard_payload(input_dir: str, output_dir: str) -> Dict[str, object
     categories = organize_images_by_category(output_dir)
     label_manager = LabelManager(output_dir)
     identity_collections = build_identity_collections(label_manager)
+    vault_summary = build_vault_summary()
 
     lane_payload = {
         "working_dir": {
@@ -1450,9 +1776,12 @@ def build_dashboard_payload(input_dir: str, output_dir: str) -> Dict[str, object
             "identityCount": len(collections_payload),
             "peopleSignalCount": lane_payload["people"]["count"],
             "animalSignalCount": lane_payload["animals"]["count"],
+            "sourceVaultCount": vault_summary["sourceCount"],
+            "duplicateUploadCount": vault_summary["blockedDuplicateAttempts"],
         },
         "identityCollections": collections_payload,
         "lanes": lane_payload,
+        "vault": vault_summary,
     }
 
 
@@ -1537,15 +1866,17 @@ def build_lab_payload(output_dir: str) -> Dict[str, object]:
 @app.route("/")
 def index():
     """Main page - show image categories"""
-    if len(sys.argv) < 3:
+    try:
+        resolved_dirs = get_runtime_directories()
+    except RuntimeError:
         return (
             "Error: PhotoFinder web UI requires input and output directories.<br>"
             "Usage: python web_ui.py <input_directory> <output_directory>",
             400,
         )
 
-    input_dir = sys.argv[1]
-    output_dir = sys.argv[2]
+    input_dir = str(resolved_dirs.source_dir)
+    output_dir = str(resolved_dirs.data_dir)
 
     # Security: validate paths
     if not is_safe_path(os.getcwd(), input_dir) or not is_safe_path(os.getcwd(), output_dir):
@@ -1570,16 +1901,35 @@ def index():
 @app.route("/api/dashboard")
 def dashboard_api():
     """JSON payload for the React frontend dashboard."""
-    if len(sys.argv) < 3:
+    try:
+        resolved_dirs = get_runtime_directories()
+    except RuntimeError:
         return jsonify({"error": "Missing directory arguments"}), 400
 
-    input_dir = sys.argv[1]
-    output_dir = sys.argv[2]
+    input_dir = str(resolved_dirs.source_dir)
+    output_dir = str(resolved_dirs.data_dir)
 
     if not is_safe_path(os.getcwd(), input_dir) or not is_safe_path(os.getcwd(), output_dir):
         return jsonify({"error": "Invalid directory paths"}), 400
 
     return jsonify(build_dashboard_payload(input_dir, output_dir))
+
+
+@app.route("/api/vault/browser")
+def vault_browser_api():
+    """JSON payload for browsing immutable source originals with hashes and debug artifacts."""
+    try:
+        resolved_dirs = get_runtime_directories()
+    except RuntimeError:
+        return jsonify({"error": "Missing directory arguments"}), 400
+
+    input_dir = str(resolved_dirs.source_dir)
+    output_dir = str(resolved_dirs.data_dir)
+
+    if not is_safe_path(os.getcwd(), input_dir) or not is_safe_path(os.getcwd(), output_dir):
+        return jsonify({"error": "Invalid directory paths"}), 400
+
+    return jsonify(build_vault_browser_payload(input_dir, output_dir))
 
 
 @app.route("/lab")
@@ -1601,10 +1951,12 @@ def react_identity_lab():
 @app.route("/api/lab")
 def lab_api():
     """JSON payload for the React frontend lab view."""
-    if len(sys.argv) < 3:
+    try:
+        resolved_dirs = get_runtime_directories()
+    except RuntimeError:
         return jsonify({"error": "Missing directory arguments"}), 400
 
-    output_dir = sys.argv[2]
+    output_dir = str(resolved_dirs.data_dir)
 
     if not is_safe_path(os.getcwd(), output_dir):
         return jsonify({"error": "Invalid directory paths"}), 400
@@ -1659,13 +2011,40 @@ def ingest_upload_api():
     """Handle vault-safe file uploads and immediately mirror them into the app workflow."""
     try:
         bundle = get_runtime_bundle()
-        upload = request.files.get("file")
-        if upload is None:
+        uploads = request.files.getlist("files")
+        single_upload = request.files.get("file")
+        if not uploads and single_upload is not None:
+            uploads = [single_upload]
+
+        if not uploads:
             return jsonify({"error": "Missing uploaded file under field name 'file'"}), 400
 
-        result = bundle["ingest_manager"].ingest_upload(upload)
+        results = []
+        failures = []
+        for upload in uploads:
+            try:
+                result = bundle["ingest_manager"].ingest_upload(upload)
+                record_upload_activity(bundle["browser_workspace"], result)
+                results.append(result)
+                index_ingest_result(result)
+            except ValueError as exc:
+                if len(uploads) == 1:
+                    return jsonify({"error": str(exc)}), 400
+                failures.append({"filename": str(getattr(upload, "filename", "unknown")), "error": str(exc)})
+            except Exception as exc:
+                if len(uploads) == 1:
+                    raise
+                LOGGER.exception("Upload ingest failed for %s", getattr(upload, "filename", "unknown"))
+                failures.append({"filename": str(getattr(upload, "filename", "unknown")), "error": str(exc)})
+
+        if not results and failures:
+            return jsonify({"error": failures[0]["error"], "failures": failures}), 400
+
         invalidate_runtime_caches()
-        return jsonify(build_upload_response(result))
+        if len(uploads) == 1 and results:
+            return jsonify(build_upload_response(results[0]))
+
+        return jsonify(build_batch_upload_response(results, failures=failures))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
@@ -1748,10 +2127,12 @@ def serve_working_dir(filename):
 @app.route("/label")
 def label_page():
     """Labeling page for reviewing and assigning labels to detections"""
-    if len(sys.argv) < 3:
+    try:
+        resolved_dirs = get_runtime_directories()
+    except RuntimeError:
         return "Error: PhotoFinder web UI requires input and output directories.", 400
 
-    output_dir = sys.argv[2]
+    output_dir = str(resolved_dirs.data_dir)
 
     # Security: validate path
     if not is_safe_path(os.getcwd(), output_dir):
@@ -1775,10 +2156,12 @@ def label_page():
 @app.route("/api/label", methods=["POST"])
 def save_label():
     """API endpoint for saving/rejecting labels"""
-    if len(sys.argv) < 3:
+    try:
+        resolved_dirs = get_runtime_directories()
+    except RuntimeError:
         return jsonify({"error": "Missing directory arguments"}), 400
 
-    output_dir = sys.argv[2]
+    output_dir = str(resolved_dirs.data_dir)
 
     # Security: validate path
     if not is_safe_path(os.getcwd(), output_dir):
@@ -1813,10 +2196,12 @@ def save_label():
 @app.route("/api/label/batch", methods=["POST"])
 def save_label_batch():
     """Persist multiple detection labels in one request."""
-    if len(sys.argv) < 3:
+    try:
+        resolved_dirs = get_runtime_directories()
+    except RuntimeError:
         return jsonify({"error": "Missing directory arguments"}), 400
 
-    output_dir = sys.argv[2]
+    output_dir = str(resolved_dirs.data_dir)
     if not is_safe_path(os.getcwd(), output_dir):
         return jsonify({"error": "Invalid directory paths"}), 400
 
@@ -1863,6 +2248,16 @@ def not_found(_error):
     return "File not found", 404
 
 
+@app.errorhandler(RequestEntityTooLarge)
+def request_too_large(_error):
+    """Return a useful response when an upload batch exceeds the configured limit."""
+
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Upload batch too large. The app will accept smaller chunks; try the upload again."}), 413
+
+    return "Upload batch too large", 413
+
+
 @app.errorhandler(403)
 def forbidden(_error):
     """Return a simple body for rejected file access attempts."""
@@ -1883,20 +2278,21 @@ if __name__ == "__main__":
         print("Example: python web_ui.py ./working_dir ./sorted_output")
         sys.exit(1)
 
-    cli_input_dir = sys.argv[1]
-    cli_output_dir = sys.argv[2]
-
-    if not os.path.exists(cli_input_dir):
-        print(f"Error: Input directory '{cli_input_dir}' does not exist.")
-        sys.exit(1)
+    cli_runtime_dirs = resolve_runtime_directories(sys.argv[1], sys.argv[2])
+    cli_input_dir = str(cli_runtime_dirs.source_dir)
+    cli_output_dir = str(cli_runtime_dirs.data_dir)
 
     if not os.path.exists(cli_output_dir):
         print(f"Error: Output directory '{cli_output_dir}' does not exist.")
         sys.exit(1)
 
+    sys.argv = [sys.argv[0], cli_input_dir, cli_output_dir]
+
     print("Starting PhotoFinder Web UI...")
-    print(f"Working directory: {cli_input_dir}")
+    print(f"Source originals: {cli_input_dir}")
     print(f"Output directory: {cli_output_dir}")
+    if cli_runtime_dirs.legacy_source_mode:
+        print("Legacy single-folder mode detected; uploads will go into a separate source vault.")
     print("Open http://localhost:5000 in your browser")
 
     # Run in development mode with security considerations

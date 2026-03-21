@@ -16,7 +16,7 @@ import stat
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Optional
+from typing import Optional, Sequence
 
 from PIL import ExifTags, Image
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -60,6 +60,8 @@ class IngestResult(BaseModel):
     canonical_path: Path
     canonical_relative_path: str
     original_filename: Optional[str] = None
+    duplicate_source_filename: Optional[str] = None
+    duplicate_source_relative_path: Optional[str] = None
     has_person: bool = False
     has_animal: bool = False
     detection_count: int = 0
@@ -155,6 +157,8 @@ class IngestManager:
                 source_path = existing_record.source_path
                 source_relative = existing_record.relative_path
                 clean_name = source_path.name
+                duplicate_source_filename = source_path.name
+                duplicate_source_relative_path = source_relative
                 duplicate = True
             else:
                 clean_name = self._build_clean_name(digest, suffix)
@@ -162,16 +166,27 @@ class IngestManager:
                 source_relative = source_path.relative_to(self.config.source_originals).as_posix()
                 shutil.copyfile(temp_path, source_path)
                 self._set_read_only(source_path)
+                duplicate_source_filename = None
+                duplicate_source_relative_path = None
                 duplicate = False
 
             canonical_path = self.library_dir / clean_name
-            shutil.copyfile(source_path, canonical_path)
+            if not canonical_path.exists():
+                shutil.copyfile(source_path, canonical_path)
 
-            image_metadata = self._extract_image_metadata(source_path)
-            has_person, has_animal, detection_count = self._process_asset(
-                canonical_path,
-                image_metadata=image_metadata,
-            )
+            image_metadata = {
+                **self._extract_image_metadata(source_path),
+                "file_hash": digest,
+                "original_filename": original_name,
+            }
+            existing_summary = self._load_existing_processing_summary(canonical_path, digest) if duplicate else None
+            if existing_summary is not None:
+                has_person, has_animal, detection_count = existing_summary
+            else:
+                has_person, has_animal, detection_count = self._process_asset(
+                    canonical_path,
+                    image_metadata=image_metadata,
+                )
             self.mirror_manager.sync_source_index()
             self.mirror_manager.materialize_derivative(source_relative, variant="thumb")
             self.mirror_manager.materialize_derivative(source_relative, variant="preview")
@@ -185,6 +200,8 @@ class IngestManager:
                 canonical_path=canonical_path,
                 canonical_relative_path=canonical_path.relative_to(self.config.processing_root).as_posix(),
                 original_filename=original_name,
+                duplicate_source_filename=duplicate_source_filename,
+                duplicate_source_relative_path=duplicate_source_relative_path,
                 has_person=has_person,
                 has_animal=has_animal,
                 detection_count=detection_count,
@@ -192,6 +209,14 @@ class IngestManager:
             )
         finally:
             temp_path.unlink(missing_ok=True)
+
+    def ingest_uploads(self, uploads: Sequence[FileStorage]) -> list[IngestResult]:
+        """Process multiple uploads through the same immutable-ingest pipeline."""
+
+        results: list[IngestResult] = []
+        for upload in uploads:
+            results.append(self.ingest_upload(upload))
+        return results
 
     def _stream_to_temp(self, upload: FileStorage) -> tuple[str, Path]:
         digest = hashlib.sha256()
@@ -256,6 +281,27 @@ class IngestManager:
             self.logger.warning("Could not extract EXIF metadata for %s: %s", image_path, exc)
 
         return metadata
+
+    def _load_existing_processing_summary(self, canonical_path: Path, digest: str) -> tuple[bool, bool, int] | None:
+        """Reuse existing detection metadata for duplicate uploads when it matches the same file hash."""
+
+        metadata_manager = DetectionMetadata(str(self.config.processing_root))
+        existing_record = metadata_manager.get_detections(str(canonical_path))
+        if not existing_record:
+            return None
+
+        record_metadata = existing_record.get("metadata") or {}
+        existing_hash = str(record_metadata.get("file_hash") or "").strip()
+        if existing_hash and existing_hash != digest:
+            return None
+
+        detections = existing_record.get("detections") or []
+        if not detections:
+            return None
+
+        has_person = any(detection.get("class_name") == "person" for detection in detections)
+        has_animal = any(detection.get("class_name") in ANIMAL_CLASSES for detection in detections)
+        return has_person, has_animal, len(detections)
 
     def _process_asset(
         self,

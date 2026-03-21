@@ -10,7 +10,6 @@ import hashlib
 import json
 import logging
 import mimetypes
-import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Dict, Iterable, Literal, Optional
@@ -18,6 +17,8 @@ from urllib.parse import quote
 
 from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from src.runtime_paths import count_writable_source_files, harden_source_vault
 
 
 Image.MAX_IMAGE_PIXELS = None
@@ -156,6 +157,12 @@ class MirrorManager:
 
         return self.config.mirror_workspace / "model_inputs" / str(self.config.crop_size)
 
+    @property
+    def vector_db_dir(self) -> Path:
+        """Directory that stores the persistent local vector database."""
+
+        return self.config.mirror_workspace / "vector_db"
+
     def ensure_layout(self) -> None:
         """Create the mutable workspace layout without touching the source tree."""
         self.config.mirror_workspace.mkdir(parents=True, exist_ok=True)
@@ -165,6 +172,7 @@ class MirrorManager:
             self.derivatives_dir / "thumb",
             self.derivatives_dir / "preview",
             self.crops_dir,
+            self.vector_db_dir,
             self.config.mirror_workspace / "logs",
             self.config.mirror_workspace / "jobs",
             self.config.mirror_workspace / "vector_index",
@@ -172,18 +180,24 @@ class MirrorManager:
             folder.mkdir(parents=True, exist_ok=True)
 
     def verify_source_contract(self) -> None:
-        """Log when the source directory appears writable.
-
-        The application still guarantees safety by never opening source files in a
-        write mode, but this warning highlights when the OS permissions do not yet
-        reflect the intended production setup.
-        """
+        """Reapply read-only protection to immutable source files and warn on drift."""
         if not self.config.source_originals.exists():
             raise FileNotFoundError(f"source_originals does not exist: {self.config.source_originals}")
 
-        if os.access(self.config.source_originals, os.W_OK):
+        hardened_files = harden_source_vault(self.config.source_originals)
+        writable_files = count_writable_source_files(self.config.source_originals)
+
+        if hardened_files:
+            self.logger.info(
+                "Reapplied read-only protection to %s source file(s) in %s",
+                hardened_files,
+                self.config.source_originals,
+            )
+
+        if writable_files:
             self.logger.warning(
-                "source_originals appears writable; enforce read-only permissions at the filesystem level: %s",
+                "source_originals still has %s writable file(s); investigate filesystem permissions: %s",
+                writable_files,
                 self.config.source_originals,
             )
 
