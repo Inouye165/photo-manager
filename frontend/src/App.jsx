@@ -57,7 +57,19 @@ function matchesReviewFilter(detection, reviewFilter) {
 }
 
 function matchesSubjectFilter(detection, subjectFilter) {
-  return subjectFilter === 'all' || detection.subject_group === subjectFilter
+  if (subjectFilter === 'all') {
+    return true
+  }
+
+  if (subjectFilter === 'people') {
+    return detection.subject_group === 'person'
+  }
+
+  if (subjectFilter === 'animals') {
+    return detection.subject_group !== 'person' && detection.subject_group !== 'unknown'
+  }
+
+  return detection.subject_group === subjectFilter
 }
 
 function matchesSearch(detection, searchTerm) {

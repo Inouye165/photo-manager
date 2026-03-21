@@ -126,24 +126,34 @@ class MirrorManager:
     """Build and maintain a mutable mirror around a read-only photo archive."""
 
     def __init__(self, config: MirrorConfig, logger: Optional[logging.Logger] = None):
+        """Create a mirror manager bound to one immutable source tree and workspace."""
+
         self.config = config
         self.logger = logger or logging.getLogger("photofinder.mirror")
         self.ensure_layout()
 
     @property
     def manifests_dir(self) -> Path:
+        """Directory that stores source manifests and related metadata."""
+
         return self.config.mirror_workspace / "metadata"
 
     @property
     def manifest_path(self) -> Path:
+        """Manifest file path for the synchronized source index."""
+
         return self.manifests_dir / self.config.manifest_name
 
     @property
     def derivatives_dir(self) -> Path:
+        """Root directory for browser-safe derivative images."""
+
         return self.config.mirror_workspace / "derivatives"
 
     @property
     def crops_dir(self) -> Path:
+        """Root directory for normalized model-input crops."""
+
         return self.config.mirror_workspace / "model_inputs" / str(self.config.crop_size)
 
     def ensure_layout(self) -> None:

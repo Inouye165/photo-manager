@@ -1,0 +1,18 @@
+[MAIN]
+extension-pkg-allow-list=cv2
+
+[FORMAT]
+max-line-length=160
+
+[TYPECHECK]
+generated-members=cv2.*
+
+[MESSAGES CONTROL]
+disable=
+	broad-exception-caught,
+	too-many-lines,
+	too-many-instance-attributes,
+	too-many-arguments,
+	too-many-locals,
+	too-many-branches,
+	too-many-statements

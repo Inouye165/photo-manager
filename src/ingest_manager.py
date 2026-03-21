@@ -18,7 +18,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Optional
 
-from PIL import Image
+from PIL import ExifTags, Image
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from src.detection_metadata import DetectionMetadata
@@ -84,30 +84,44 @@ class IngestManager:
 
     @property
     def library_dir(self) -> Path:
+        """Directory that stores canonical working copies of uploaded files."""
+
         return self.config.processing_root / "_library"
 
     @property
     def people_dir(self) -> Path:
+        """Directory that stores source images containing people."""
+
         return self.config.processing_root / "people"
 
     @property
     def animals_dir(self) -> Path:
+        """Directory that stores source images containing animals."""
+
         return self.config.processing_root / "animals"
 
     @property
     def others_dir(self) -> Path:
+        """Directory that stores source images with no tracked subjects."""
+
         return self.config.processing_root / "others"
 
     @property
     def debug_dir(self) -> Path:
+        """Directory that stores detection debug overlays."""
+
         return self.config.processing_root / "_debug_boxes"
 
     @property
     def crops_people_dir(self) -> Path:
+        """Directory that stores cropped training examples for people."""
+
         return self.config.processing_root / "_training_crops" / "people"
 
     @property
     def crops_animals_dir(self) -> Path:
+        """Directory that stores cropped training examples for animals."""
+
         return self.config.processing_root / "_training_crops" / "animals"
 
     def _ensure_layout(self) -> None:
@@ -153,7 +167,11 @@ class IngestManager:
             canonical_path = self.library_dir / clean_name
             shutil.copyfile(source_path, canonical_path)
 
-            has_person, has_animal, detection_count = self._process_asset(canonical_path)
+            image_metadata = self._extract_image_metadata(source_path)
+            has_person, has_animal, detection_count = self._process_asset(
+                canonical_path,
+                image_metadata=image_metadata,
+            )
             self.mirror_manager.sync_source_index()
             self.mirror_manager.materialize_derivative(source_relative, variant="thumb")
             self.mirror_manager.materialize_derivative(source_relative, variant="preview")
@@ -206,7 +224,47 @@ class IngestManager:
         if os.name == "nt":
             path.chmod(stat.S_IREAD)
 
-    def _process_asset(self, canonical_path: Path) -> tuple[bool, bool, int]:
+    def _extract_image_metadata(self, image_path: Path) -> dict[str, str]:
+        """Read lightweight EXIF metadata needed by the search and labeling UI."""
+
+        metadata: dict[str, str] = {}
+
+        try:
+            with Image.open(image_path) as image:
+                exif = image.getexif()
+                if not exif:
+                    return metadata
+
+                exif_map = {
+                    str(ExifTags.TAGS.get(tag_id, tag_id)): value
+                    for tag_id, value in exif.items()
+                }
+                captured_at = (
+                    exif_map.get("DateTimeOriginal")
+                    or exif_map.get("DateTimeDigitized")
+                    or exif_map.get("DateTime")
+                )
+                if captured_at:
+                    normalized = (
+                        str(captured_at)
+                        .strip()
+                        .replace(":", "-", 2)
+                        .replace(" ", "T", 1)
+                    )
+                    metadata["captured_at"] = normalized
+        except Exception as exc:  # pragma: no cover - best effort metadata extraction
+            self.logger.warning("Could not extract EXIF metadata for %s: %s", image_path, exc)
+
+        return metadata
+
+    def _process_asset(
+        self,
+        canonical_path: Path,
+        *,
+        image_metadata: Optional[dict[str, str]] = None,
+    ) -> tuple[bool, bool, int]:
+        """Run detection, write derivatives, and persist detection metadata."""
+
         subjects = self.image_processor.detect_subjects(str(canonical_path))
         has_person = bool(subjects.get("has_person"))
         has_animal = bool(subjects.get("has_animal"))
@@ -233,13 +291,17 @@ class IngestManager:
 
             crop_path = crop_dir / f"{canonical_path.stem}_crop_{index}_{class_name}.jpg"
             if self.image_processor.generate_crop(str(canonical_path), detection["bbox"], str(crop_path)):
-                detection["crop_path"] = os.path.relpath(crop_path, self.config.processing_root).replace("\\", "/")
+                detection["crop_path"] = os.path.relpath(
+                    crop_path,
+                    self.config.processing_root,
+                ).replace("\\", "/")
 
         metadata_manager = DetectionMetadata(str(self.config.processing_root))
         metadata_manager.add_detections(
             str(canonical_path),
             detailed_detections,
             str(debug_path) if debug_result.get("saved") else None,
+            extra_metadata=image_metadata,
         )
         return has_person, has_animal, len(detailed_detections)
 
