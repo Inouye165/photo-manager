@@ -1,3 +1,5 @@
+"""Regression tests for the immutable ingest pipeline."""
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,25 +11,39 @@ from src.mirror_manager import MirrorConfig, MirrorManager
 
 
 class StubImageProcessor:
+    """Minimal detector stub used to exercise ingest behavior in isolation."""
+
     def detect_subjects(self, _image_path):
+        """Return a stable detection summary for the uploaded image."""
+
         return {"has_person": True, "has_animal": False}
 
     def annotate_detections(self, _image_path, output_path, _confidence_threshold=0.10):
+        """Write a fake debug artifact and report success."""
+
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         Path(output_path).write_bytes(b'debug')
         return {"saved": True}
 
     def get_detailed_detections(self, _image_path, _confidence_threshold=0.25):
+        """Return one deterministic person detection for test assertions."""
+
         return [{"class_name": "person", "confidence": 0.9, "bbox": [0, 0, 10, 10], "bbox_area": 100}]
 
     def generate_crop(self, _image_path, _bbox, output_path):
+        """Write a deterministic crop image for downstream ingest checks."""
+
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         Image.new('RGB', (32, 32), color=(100, 50, 25)).save(output_path)
         return True
 
 
 class TestIngestManager(unittest.TestCase):
+    """Verify ingest persistence, duplicate detection, and file protections."""
+
     def test_ingest_upload_sets_read_only_and_detects_duplicate(self):
+        """The second upload of identical bytes should reuse the first immutable source file."""
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             source_dir = root / 'source_originals'

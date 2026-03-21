@@ -7,11 +7,21 @@ Security-focused implementation with proper input validation and file access con
 import os
 import sys
 import logging
+from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
 from typing import Dict, List, Optional
 
-from flask import Flask, abort, render_template, send_file, send_from_directory, request, jsonify
+from flask import (
+    Flask,
+    abort,
+    jsonify,
+    render_template,
+    request,
+    send_file,
+    send_from_directory,
+)
 import pillow_heif
 from PIL import Image, ImageOps
 
@@ -80,16 +90,15 @@ def convert_heic_to_jpeg(heic_path: str) -> bytes:
     """Convert HEIC file to JPEG bytes for web display"""
     try:
         pillow_heif.register_heif_opener()
-        
+
         # Open HEIC and convert to RGB
         img = Image.open(heic_path)
-        if img.mode in ('RGBA', 'LA', 'P'):
-            img = img.convert('RGB')
-        
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGB")
+
         # Save to JPEG bytes
-        from io import BytesIO
         jpeg_bytes = BytesIO()
-        img.save(jpeg_bytes, format='JPEG', quality=85)
+        img.save(jpeg_bytes, format="JPEG", quality=85)
         jpeg_bytes.seek(0)
         return jpeg_bytes.getvalue()
     except Exception as e:
@@ -239,6 +248,59 @@ def normalize_relative_path(path_value: Optional[str]) -> Optional[str]:
     if not path_value:
         return None
     return Path(str(path_value).replace("\\", "/")).as_posix()
+
+
+def build_detection_record_id(image_path: str, detection_index: int) -> str:
+    """Create a stable vector record id for one detection."""
+    return f"{normalize_relative_path(image_path) or image_path}#{int(detection_index)}"
+
+
+def build_negative_record_id(image_path: str, detection_index: int, label: str) -> str:
+    """Create a stable negative-memory id for one rejected label on one detection."""
+    return f"negative::{build_detection_record_id(image_path, detection_index)}::{label.strip().lower()}"
+
+
+def parse_date_range(value: Optional[str]) -> tuple[Optional[datetime], Optional[datetime]]:
+    """Parse a comma-delimited ISO-like date range."""
+    if not value:
+        return None, None
+
+    parts = [part.strip() for part in str(value).split(",", 1)]
+    if not parts:
+        return None, None
+
+    def _parse(part: str) -> Optional[datetime]:
+        if not part:
+            return None
+        normalized = part.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized)
+        except ValueError:
+            return datetime.fromisoformat(f"{normalized}T00:00:00")
+
+    start = _parse(parts[0])
+    end = _parse(parts[1]) if len(parts) > 1 else None
+    return start, end
+
+
+def captured_at_in_range(captured_at: Optional[str], start: Optional[datetime], end: Optional[datetime]) -> bool:
+    """Return true when a captured_at timestamp falls inside the requested range."""
+    if not start and not end:
+        return True
+    if not captured_at:
+        return False
+
+    normalized = str(captured_at).replace("Z", "+00:00")
+    try:
+        captured = datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+
+    if start and captured < start:
+        return False
+    if end and captured > end:
+        return False
+    return True
 
 
 def resolve_existing_asset(base_dir: Path, relative_path: Optional[str]) -> Optional[Path]:
@@ -457,13 +519,13 @@ def organize_images_by_category(base_dir: str) -> Dict[str, List[Dict[str, str]]
 
     # Categorize files (only from subdirectories, not root working_dir files)
     working_file_names = {f["filename"] for f in working_files}
-    
+
     for file_info in all_files:
         filename = file_info["filename"]
         # Skip files that are in the root working directory
         if filename in working_file_names:
             continue
-            
+
         in_people = filename in people_files
         in_animals = filename in animals_files
         in_others = filename in others_files
@@ -603,8 +665,19 @@ def serialize_gallery_items(items: List[Dict[str, str]], base_dir: str, route_pr
 
 
 def get_subject_group(detected_class: str) -> str:
-    """Map concrete detector classes into the product's two major lanes."""
-    return "people" if detected_class == "person" else "animals"
+    """Return the exact YOLO class so identity comparisons stay class-strict."""
+    normalized = str(detected_class or "").strip().lower()
+    return normalized or "unknown"
+
+
+def get_subject_lane(detected_class: str) -> str:
+    """Map detector classes back to the broader people-versus-animals lanes."""
+    subject_group = get_subject_group(detected_class)
+    if subject_group == "person":
+        return "people"
+    if subject_group == "unknown":
+        return "unknown"
+    return "animals"
 
 
 def get_review_bucket(detection: Dict[str, object]) -> str:
@@ -642,8 +715,13 @@ def build_queue_summary(detections: List[Dict[str, object]]) -> Dict[str, int]:
     }
 
     for detection in detections:
-        subject_group = detection.get("subject_group", "animals")
+        subject_group = str(detection.get("subject_group") or "unknown").strip().lower() or "unknown"
+        summary.setdefault(subject_group, 0)
         summary[subject_group] += 1
+        if subject_group == "person":
+            summary["people"] += 1
+        elif subject_group != "unknown":
+            summary["animals"] += 1
 
         if detection["status"] != "pending":
             summary["done"] += 1
@@ -669,22 +747,29 @@ def bootstrap_intelligence_index(
 ) -> None:
     """Rebuild the live vector index from confirmed labels."""
     intelligence_core.reset_vector_index()
+    metadata_manager = DetectionMetadata(str(data_dir))
 
     for label_record in label_manager.get_all_labels(status="confirmed"):
         assigned_label = str(label_record.get("assigned_label") or "").strip()
         if not assigned_label:
             continue
 
+        image_path = normalize_relative_path(label_record.get("image_path")) or assigned_label
+        detection_index = int(label_record.get("detection_index", 0))
+        detection_record = metadata_manager.get_detections(os.path.join(str(data_dir), image_path))
+        image_metadata = dict(detection_record.get("metadata") or {})
+
         subject_type = get_subject_group(str(label_record.get("detected_class") or ""))
+        subject_lane = get_subject_lane(str(label_record.get("detected_class") or ""))
         asset_payload = resolve_detection_asset_urls(
             mirror_manager=mirror_manager,
             source_dir=source_dir,
             data_dir=data_dir,
             browser_workspace=browser_workspace,
-            image_path=str(label_record.get("image_path") or ""),
+            image_path=image_path,
             crop_path=label_record.get("crop_path"),
             bbox=label_record.get("bbox"),
-            subject_type=subject_type,
+            subject_type=subject_lane,
             identity_hint=assigned_label,
         )
         embedding_path = asset_payload.get("embedding_path")
@@ -692,24 +777,144 @@ def bootstrap_intelligence_index(
             continue
 
         intelligence_core.learn_from_label(
-            relative_path=normalize_relative_path(label_record.get("image_path")) or assigned_label,
+            record_id=build_detection_record_id(image_path, detection_index),
+            relative_path=build_detection_record_id(image_path, detection_index),
             image_path=Path(embedding_path),
             identity_label=assigned_label,
             subject_type=subject_type,
+            class_name=str(label_record.get("detected_class") or "").strip().lower() or None,
             metadata={
                 "preview_url": asset_payload.get("candidate_image_url"),
                 "full_url": asset_payload.get("candidate_full_url"),
-                "image_path": normalize_relative_path(label_record.get("image_path")),
+                "image_path": image_path,
                 "crop_path": normalize_relative_path(label_record.get("crop_path")),
                 "label_id": label_record.get("id"),
+                "captured_at": image_metadata.get("captured_at"),
             },
             human_verified=False,
             schedule_fine_tune=False,
         )
 
 
-def build_identity_tasks(limit: int = 18) -> List[Dict[str, object]]:
-    """Build verification tasks from pending detections using the active-learning core."""
+def serialize_semantic_hit(hit, bundle: Dict[str, object]) -> Dict[str, object]:
+    """Attach preview URLs and display metadata to a vector search hit."""
+    source_dir = bundle["source_dir"]
+    data_dir = bundle["data_dir"]
+    browser_workspace = bundle["browser_workspace"]
+    mirror_manager = bundle["mirror_manager"]
+
+    metadata = dict(hit.metadata or {})
+    image_path = normalize_relative_path(metadata.get("image_path"))
+    crop_path = normalize_relative_path(metadata.get("crop_path"))
+    detected_class = str(metadata.get("detected_class") or hit.class_name or "").strip().lower()
+    subject_lane = get_subject_lane(detected_class) if detected_class else "unknown"
+
+    preview_url = metadata.get("preview_url")
+    full_url = metadata.get("full_url")
+
+    if (not preview_url or not full_url) and image_path:
+        asset_payload = resolve_detection_asset_urls(
+            mirror_manager=mirror_manager,
+            source_dir=source_dir,
+            data_dir=data_dir,
+            browser_workspace=browser_workspace,
+            image_path=image_path,
+            crop_path=crop_path,
+            bbox=metadata.get("bbox"),
+            subject_type=subject_lane,
+            identity_hint=hit.identity_label,
+        )
+        preview_url = preview_url or asset_payload.get("candidate_image_url")
+        full_url = full_url or asset_payload.get("candidate_full_url")
+
+    return {
+        "record_id": hit.record_id,
+        "label": hit.identity_label,
+        "score": hit.score,
+        "confidence": round(bundle["intelligence_core"].score_to_confidence(hit.score) * 100, 1),
+        "subject_type": hit.subject_type,
+        "detected_class": detected_class or None,
+        "relative_path": hit.relative_path,
+        "image_path": image_path,
+        "crop_path": crop_path,
+        "preview_url": preview_url,
+        "full_url": full_url,
+        "metadata": metadata,
+    }
+
+
+def build_confirmed_identity_tasks(
+    *,
+    label_manager: LabelManager,
+    data_dir: Path,
+    source_dir: Path,
+    browser_workspace: Path,
+    mirror_manager: MirrorManager,
+    limit: int = 48,
+) -> List[Dict[str, object]]:
+    """Build confirmed detections so users can edit labels directly in Identity Lab."""
+    metadata_manager = DetectionMetadata(str(data_dir))
+    confirmed_tasks: List[Dict[str, object]] = []
+
+    for label_record in label_manager.get_all_labels(status="confirmed")[:limit]:
+        image_path = normalize_relative_path(label_record.get("image_path"))
+        if not image_path:
+            continue
+
+        detection_index = int(label_record.get("detection_index", 0))
+        detected_class = str(label_record.get("detected_class") or "").strip().lower()
+        detection_record = metadata_manager.get_detections(os.path.join(str(data_dir), image_path))
+        image_metadata = dict(detection_record.get("metadata") or {})
+        asset_payload = resolve_detection_asset_urls(
+            mirror_manager=mirror_manager,
+            source_dir=source_dir,
+            data_dir=data_dir,
+            browser_workspace=browser_workspace,
+            image_path=image_path,
+            crop_path=label_record.get("crop_path"),
+            bbox=label_record.get("bbox"),
+            subject_type=get_subject_lane(detected_class),
+            identity_hint=label_record.get("assigned_label"),
+        )
+
+        confirmed_tasks.append(
+            {
+                "record_id": build_detection_record_id(image_path, detection_index),
+                "detection_key": f"{image_path}:{detection_index}",
+                "image_path": image_path,
+                "detection_index": detection_index,
+                "detected_class": detected_class,
+                "assigned_label": label_record.get("assigned_label"),
+                "candidate_image_url": asset_payload.get("candidate_image_url"),
+                "candidate_full_url": asset_payload.get("candidate_full_url"),
+                "crop_path": normalize_relative_path(label_record.get("crop_path")),
+                "captured_at": image_metadata.get("captured_at"),
+            }
+        )
+
+    return confirmed_tasks
+
+
+def infer_semantic_search_class_name(query: str, label_manager: LabelManager) -> Optional[str]:
+    """Infer a strict YOLO class filter from confirmed labels matching the query."""
+    normalized_query = str(query or "").strip().lower()
+    if not normalized_query:
+        return None
+
+    matched_classes = {
+        str(label_record.get("detected_class") or "").strip().lower()
+        for label_record in label_manager.get_all_labels(status="confirmed")
+        if str(label_record.get("assigned_label") or "").strip().lower() == normalized_query
+        and str(label_record.get("detected_class") or "").strip()
+    }
+
+    if len(matched_classes) == 1:
+        return next(iter(matched_classes))
+    return None
+
+
+def build_identity_tasks(limit: int = 120) -> Dict[str, object]:
+    """Build grid-label tasks from pending detections using the active-learning core."""
     bundle = get_runtime_bundle()
     source_dir = bundle["source_dir"]
     data_dir = bundle["data_dir"]
@@ -723,6 +928,7 @@ def build_identity_tasks(limit: int = 18) -> List[Dict[str, object]]:
 
     metadata_manager = DetectionMetadata(str(data_dir))
     label_manager = LabelManager(str(data_dir))
+    identity_engine = IdentityEngine(str(data_dir))
     bootstrap_intelligence_index(
         intelligence_core=intelligence_core,
         label_manager=label_manager,
@@ -733,10 +939,12 @@ def build_identity_tasks(limit: int = 18) -> List[Dict[str, object]]:
     )
 
     tasks = []
+    task_index: Dict[str, Dict[str, object]] = {}
     detection_records = metadata_manager.get_images_with_detections()
 
     for record in detection_records:
         image_rel_path = to_web_path(record["image_path"])
+        image_metadata = dict(record.get("metadata") or {})
         existing_labels = label_manager.get_labels_for_image(os.path.join(str(data_dir), image_rel_path))
         existing_labels_by_index = {label["detection_index"]: label for label in existing_labels}
 
@@ -746,6 +954,7 @@ def build_identity_tasks(limit: int = 18) -> List[Dict[str, object]]:
 
             detected_class = str(detection.get("class_name") or "")
             subject_type = get_subject_group(detected_class)
+            subject_lane = get_subject_lane(detected_class)
             asset_payload = resolve_detection_asset_urls(
                 mirror_manager=mirror_manager,
                 source_dir=source_dir,
@@ -754,7 +963,7 @@ def build_identity_tasks(limit: int = 18) -> List[Dict[str, object]]:
                 image_path=image_rel_path,
                 crop_path=detection.get("crop_path"),
                 bbox=detection.get("bbox"),
-                subject_type=subject_type,
+                subject_type=subject_lane,
                 identity_hint=detected_class,
             )
             embedding_path = asset_payload.get("embedding_path")
@@ -765,10 +974,8 @@ def build_identity_tasks(limit: int = 18) -> List[Dict[str, object]]:
                 relative_path=f"{image_rel_path}#{detection_index}",
                 subject_type=subject_type,
                 image_path=Path(embedding_path),
+                class_name=detected_class.strip().lower() or None,
             )
-
-            if task.status == "new_identity" or not task.proposed_label:
-                continue
 
             task.candidate_image_url = asset_payload.get("candidate_image_url")
             task.candidate_full_url = asset_payload.get("candidate_full_url")
@@ -781,6 +988,7 @@ def build_identity_tasks(limit: int = 18) -> List[Dict[str, object]]:
                 "confidence": detection.get("confidence"),
                 "subject_type": subject_type,
                 "source_relative_path": asset_payload.get("source_relative_path") or image_rel_path,
+                "captured_at": image_metadata.get("captured_at"),
             }
 
             gallery_items = []
@@ -793,7 +1001,7 @@ def build_identity_tasks(limit: int = 18) -> List[Dict[str, object]]:
                     image_path=str(gallery_label.get("image_path") or ""),
                     crop_path=gallery_label.get("crop_path"),
                     bbox=gallery_label.get("bbox"),
-                    subject_type=get_subject_group(str(gallery_label.get("detected_class") or "")),
+                    subject_type=get_subject_lane(str(gallery_label.get("detected_class") or "")),
                     identity_hint=task.proposed_label,
                 )
                 if gallery_assets.get("candidate_image_url"):
@@ -806,7 +1014,21 @@ def build_identity_tasks(limit: int = 18) -> List[Dict[str, object]]:
                     )
 
             task.known_gallery = gallery_items
-            tasks.append(task.model_dump(mode="json"))
+            task_payload = task.model_dump(mode="json")
+            task_payload.update(
+                {
+                    "detection_key": f"{image_rel_path}:{detection_index}",
+                    "image_path": image_rel_path,
+                    "detection_index": detection_index,
+                    "detected_class": detected_class,
+                    "crop_path": normalize_relative_path(detection.get("crop_path")),
+                    "batch_cluster_id": None,
+                    "batch_cluster_size": 1,
+                    "captured_at": image_metadata.get("captured_at"),
+                }
+            )
+            tasks.append(task_payload)
+            task_index[task_payload["detection_key"]] = task_payload
 
             if len(tasks) >= limit:
                 break
@@ -814,16 +1036,80 @@ def build_identity_tasks(limit: int = 18) -> List[Dict[str, object]]:
         if len(tasks) >= limit:
             break
 
-    tasks.sort(key=lambda item: (0 if item["status"] == "needs_confirmation" else 1, item["confidence"]))
+    cluster_inputs = [
+        {
+            "image_path": task["image_path"],
+            "detection_index": task["detection_index"],
+            "detected_class": task["detected_class"],
+            "crop_path": task["crop_path"],
+            "status": "pending",
+            "suggestion": {"label": task.get("proposed_label"), "confidence": int(task.get("confidence", 0) * 100)} if task.get("proposed_label") else None,
+        }
+        for task in tasks
+    ]
+    batch_suggestions = []
+    for cluster in identity_engine.build_batch_suggestions(cluster_inputs):
+        preview_url = None
+        for detection_key in cluster.detection_keys:
+            task_payload = task_index.get(detection_key)
+            if task_payload and task_payload.get("candidate_image_url"):
+                preview_url = task_payload["candidate_image_url"]
+                break
+
+        batch_suggestions.append(
+            {
+                "cluster_id": cluster.cluster_id,
+                "detected_class": cluster.detected_class,
+                "subject_group": cluster.subject_group,
+                "member_count": cluster.member_count,
+                "confidence": round(cluster.confidence * 100, 1),
+                "suggested_label": cluster.suggested_label,
+                "detection_keys": list(cluster.detection_keys),
+                "preview_url": preview_url,
+            }
+        )
+
+        for detection_key in cluster.detection_keys:
+            task_payload = task_index.get(detection_key)
+            if task_payload is not None:
+                task_payload["batch_cluster_id"] = cluster.cluster_id
+                task_payload["batch_cluster_size"] = cluster.member_count
+
+    tasks.sort(
+        key=lambda item: (
+            0 if item.get("proposed_label") else 1,
+            0 if item.get("batch_cluster_size", 1) > 1 else 1,
+            item["detected_class"],
+            -item["confidence"],
+        )
+    )
+    payload = {
+        "tasks": tasks,
+        "confirmed_tasks": build_confirmed_identity_tasks(
+            label_manager=label_manager,
+            data_dir=data_dir,
+            source_dir=source_dir,
+            browser_workspace=browser_workspace,
+            mirror_manager=mirror_manager,
+        ),
+        "name_options": label_manager.get_unique_assigned_labels(),
+        "batch_suggestions": batch_suggestions,
+        "stats": {
+            "task_count": len(tasks),
+            "suggested_count": sum(1 for task in tasks if task.get("proposed_label")),
+            "cluster_count": len(batch_suggestions),
+            "confirmed_count": len(label_manager.get_all_labels(status="confirmed")),
+        },
+    }
     IDENTITY_TASK_CACHE["key"] = cache_key
-    IDENTITY_TASK_CACHE["payload"] = tasks
-    return tasks
+    IDENTITY_TASK_CACHE["payload"] = payload
+    return payload
 
 
 def build_upload_response(result) -> Dict[str, object]:
     """Create a stable JSON payload for the upload UI."""
     queue_preview = build_identity_tasks(limit=18)
-    matching_tasks = [task for task in queue_preview if task.get("metadata", {}).get("image_path") == result.canonical_relative_path]
+    matching_tasks = [task for task in queue_preview["tasks"] if task.get("metadata", {}).get("image_path") == result.canonical_relative_path]
     preview_url = f"/working_dir/{quote(result.source_relative_path, safe='/')}?variant=thumb"
 
     return {
@@ -836,9 +1122,159 @@ def build_upload_response(result) -> Dict[str, object]:
         "detection_count": result.detection_count,
         "has_person": result.has_person,
         "has_animal": result.has_animal,
-        "verification_queue_count": len(queue_preview),
+        "verification_queue_count": len(queue_preview["tasks"]),
         "uploaded_task_count": len(matching_tasks),
         "identity_lab_url": "/identity-lab",
+    }
+
+
+def persist_label_update(
+    *,
+    output_dir: str,
+    image_path: str,
+    detection_index: int,
+    assigned_label: Optional[str],
+    status: str = "confirmed",
+    rebuild_exports: bool = True,
+    invalidate_caches: bool = True,
+    suggested_label: Optional[str] = None,
+) -> Dict[str, object]:
+    """Persist a single detection label state change."""
+    metadata_manager = DetectionMetadata(output_dir)
+    label_manager = LabelManager(output_dir)
+
+    detection_record = metadata_manager.get_detections(os.path.join(output_dir, image_path))
+    if not detection_record or not detection_record.get("detections"):
+        raise FileNotFoundError("No detection data found")
+
+    detections = detection_record["detections"]
+    image_metadata = dict(detection_record.get("metadata") or {})
+    if detection_index >= len(detections):
+        raise ValueError("Invalid detection index")
+
+    detection = detections[detection_index]
+    stable_record_id = build_detection_record_id(image_path, detection_index)
+    existing_labels = label_manager.get_labels_for_image(os.path.join(output_dir, image_path))
+    existing_label = next((label for label in existing_labels if label["detection_index"] == detection_index), None)
+    prior_label = str(existing_label.get("assigned_label") or "").strip() if existing_label else ""
+
+    if existing_label:
+        if status == "pending":
+            label_manager.delete_label(existing_label["id"])
+        elif status == "rejected":
+            label_manager.update_label_status(existing_label["id"], "rejected")
+        elif assigned_label:
+            label_manager.update_label(existing_label["id"], assigned_label=assigned_label, status="confirmed")
+    else:
+        if status != "pending":
+            label_manager.add_label(
+                image_path=os.path.join(output_dir, image_path),
+                detection_index=detection_index,
+                assigned_label=assigned_label or "",
+                detected_class=detection["class_name"],
+                bbox=detection["bbox"],
+                crop_path=detection.get("crop_path"),
+                status="confirmed" if status == "confirmed" else "rejected",
+            )
+
+    export_dir = label_manager.rebuild_named_exports() if rebuild_exports else str(Path(output_dir) / "_sorted_by_name")
+
+    bundle = get_runtime_bundle()
+    subject_type = get_subject_group(detection.get("class_name", ""))
+    subject_lane = get_subject_lane(detection.get("class_name", ""))
+    asset_payload = resolve_detection_asset_urls(
+        mirror_manager=bundle["mirror_manager"],
+        source_dir=bundle["source_dir"],
+        data_dir=bundle["data_dir"],
+        browser_workspace=bundle["browser_workspace"],
+        image_path=image_path,
+        crop_path=detection.get("crop_path"),
+        bbox=detection.get("bbox"),
+        subject_type=subject_lane,
+        identity_hint=assigned_label or suggested_label,
+    )
+    embedding_path = Path(asset_payload["embedding_path"]) if asset_payload.get("embedding_path") else None
+
+    if status == "confirmed" and assigned_label:
+        if embedding_path is not None:
+            bundle["intelligence_core"].learn_from_label(
+                record_id=stable_record_id,
+                relative_path=stable_record_id,
+                image_path=embedding_path,
+                identity_label=assigned_label,
+                subject_type=subject_type,
+                class_name=str(detection.get("class_name") or "").strip().lower() or None,
+                metadata={
+                    "preview_url": asset_payload.get("candidate_image_url"),
+                    "full_url": asset_payload.get("candidate_full_url"),
+                    "image_path": image_path,
+                    "crop_path": normalize_relative_path(detection.get("crop_path")),
+                    "bbox": detection.get("bbox"),
+                    "detected_class": detection.get("class_name"),
+                    "captured_at": image_metadata.get("captured_at"),
+                },
+                human_verified=True,
+                schedule_fine_tune=False,
+            )
+            bundle["intelligence_core"].remove_negative_sample(assigned_label, build_negative_record_id(image_path, detection_index, assigned_label))
+        if prior_label and prior_label != assigned_label:
+            bundle["intelligence_core"].remove_negative_sample(prior_label, build_negative_record_id(image_path, detection_index, prior_label))
+    elif status == "rejected" and suggested_label and embedding_path is not None:
+        bundle["intelligence_core"].add_negative_sample(
+            record_id=build_negative_record_id(image_path, detection_index, suggested_label),
+            relative_path=stable_record_id,
+            negative_label=suggested_label,
+            image_path=embedding_path,
+            subject_type=subject_type,
+            class_name=str(detection.get("class_name") or "").strip().lower() or None,
+            metadata={
+                "image_path": image_path,
+                "crop_path": normalize_relative_path(detection.get("crop_path")),
+                "detected_class": detection.get("class_name"),
+                "captured_at": image_metadata.get("captured_at"),
+            },
+        )
+
+    if invalidate_caches:
+        invalidate_runtime_caches()
+
+    return {"success": True, "export_dir": export_dir}
+
+
+def build_semantic_search_payload(
+    query: str,
+    limit: int = 24,
+    class_name: Optional[str] = None,
+    date_range: Optional[str] = None,
+) -> Dict[str, object]:
+    """Run semantic search against the live vector index and attach URLs."""
+    bundle = get_runtime_bundle()
+    label_manager = LabelManager(str(bundle["data_dir"]))
+    bootstrap_intelligence_index(
+        intelligence_core=bundle["intelligence_core"],
+        label_manager=label_manager,
+        mirror_manager=bundle["mirror_manager"],
+        source_dir=bundle["source_dir"],
+        data_dir=bundle["data_dir"],
+        browser_workspace=bundle["browser_workspace"],
+    )
+
+    class_name_filter = str(class_name or "").strip().lower() or infer_semantic_search_class_name(query, label_manager)
+    start_date, end_date = parse_date_range(date_range)
+    hits = bundle["intelligence_core"].semantic_search(
+        query=query,
+        top_k=limit,
+        subject_type=class_name_filter or None,
+        class_name=class_name_filter,
+    )
+    results = [serialize_semantic_hit(hit, bundle) for hit in hits]
+    if start_date or end_date:
+        results = [result for result in results if captured_at_in_range(result.get("metadata", {}).get("captured_at"), start_date, end_date)]
+    return {
+        "query": query,
+        "class_name_filter": class_name_filter,
+        "date_range": date_range,
+        "results": results,
     }
 
 
@@ -867,12 +1303,15 @@ def persist_identity_decision(decision: VerificationDecision) -> Dict[str, objec
         raise FileNotFoundError("No detection data found for the verification task")
 
     detections = detection_record["detections"]
+    image_metadata = dict(detection_record.get("metadata") or {})
     if detection_index >= len(detections):
         raise ValueError("Invalid detection index for verification task")
 
     detection = detections[detection_index]
+    stable_record_id = build_detection_record_id(image_path, detection_index)
     existing_labels = label_manager.get_labels_for_image(os.path.join(str(data_dir), image_path))
     existing_label = next((label for label in existing_labels if label["detection_index"] == detection_index), None)
+    suggested_label = str(metadata.get("suggested_label") or metadata.get("proposed_label") or "").strip() or None
 
     asset_payload = resolve_detection_asset_urls(
         mirror_manager=mirror_manager,
@@ -882,7 +1321,7 @@ def persist_identity_decision(decision: VerificationDecision) -> Dict[str, objec
         image_path=image_path,
         crop_path=detection.get("crop_path"),
         bbox=detection.get("bbox"),
-        subject_type=decision.subject_type,
+        subject_type=get_subject_lane(decision.subject_type),
         identity_hint=decision.confirmed_label,
     )
     embedding_path = Path(asset_payload["embedding_path"]) if asset_payload.get("embedding_path") else None
@@ -902,19 +1341,24 @@ def persist_identity_decision(decision: VerificationDecision) -> Dict[str, objec
             )
 
         intelligence_core.learn_from_label(
-            relative_path=decision.relative_path,
+            record_id=stable_record_id,
+            relative_path=stable_record_id,
             image_path=embedding_path,
             identity_label=decision.confirmed_label,
             subject_type=decision.subject_type,
+            class_name=str(detection.get("class_name") or "").strip().lower() or None,
             metadata={
                 "preview_url": asset_payload.get("candidate_image_url"),
                 "full_url": asset_payload.get("candidate_full_url"),
                 "image_path": image_path,
                 "crop_path": normalize_relative_path(detection.get("crop_path")),
+                "detected_class": detection.get("class_name"),
+                "captured_at": image_metadata.get("captured_at"),
             },
             human_verified=True,
             schedule_fine_tune=decision.schedule_fine_tune,
         )
+        intelligence_core.remove_negative_sample(decision.confirmed_label, build_negative_record_id(image_path, detection_index, decision.confirmed_label))
         outcome = "confirmed"
     else:
         if existing_label:
@@ -928,6 +1372,21 @@ def persist_identity_decision(decision: VerificationDecision) -> Dict[str, objec
                 bbox=detection.get("bbox", []),
                 crop_path=detection.get("crop_path"),
                 status="rejected",
+            )
+        if suggested_label and embedding_path is not None:
+            intelligence_core.add_negative_sample(
+                record_id=build_negative_record_id(image_path, detection_index, suggested_label),
+                relative_path=stable_record_id,
+                negative_label=suggested_label,
+                image_path=embedding_path,
+                subject_type=decision.subject_type,
+                class_name=str(detection.get("class_name") or "").strip().lower() or None,
+                metadata={
+                    "image_path": image_path,
+                    "crop_path": normalize_relative_path(detection.get("crop_path")),
+                    "detected_class": detection.get("class_name"),
+                    "captured_at": image_metadata.get("captured_at"),
+                },
             )
         intelligence_core.apply_verification_decision(decision, image_path=embedding_path)
         outcome = "rejected"
@@ -1018,11 +1477,11 @@ def build_lab_payload(output_dir: str) -> Dict[str, object]:
         existing_labels = label_manager.get_labels_for_image(os.path.join(output_dir, image_rel_path))
         existing_labels_by_index = {label["detection_index"]: label for label in existing_labels}
 
-        for index, detection in enumerate(detections):
-            existing_label = existing_labels_by_index.get(index)
+        for detection_index, detection in enumerate(detections):
+            existing_label = existing_labels_by_index.get(detection_index)
             detection_info = {
                 "image_path": to_web_path(image_rel_path),
-                "detection_index": index,
+                "detection_index": detection_index,
                 "detected_class": detection["class_name"],
                 "subject_group": get_subject_group(detection["class_name"]),
                 "confidence": detection["confidence"],
@@ -1167,6 +1626,23 @@ def identity_tasks_api():
     return jsonify(build_identity_tasks())
 
 
+@app.route("/api/search/semantic")
+def semantic_search_api():
+    """Search labeled detections with a text query."""
+    query = str(request.args.get("q") or "").strip()
+    if not query:
+        return jsonify({"error": "Missing search query"}), 400
+
+    try:
+        limit = max(1, min(int(request.args.get("limit", 24)), 100))
+        class_name = str(request.args.get("class_name") or "").strip().lower() or None
+        date_range = str(request.args.get("date_range") or "").strip() or None
+        return jsonify(build_semantic_search_payload(query, limit=limit, class_name=class_name, date_range=date_range))
+    except Exception as exc:
+        LOGGER.exception("Semantic search failed")
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/identity/verify", methods=["POST"])
 def identity_verify_api():
     """Accept a verification decision and update labels plus embeddings immediately."""
@@ -1233,7 +1709,6 @@ def serve_image(filename):
     """Serve mirror-derived previews for assets that live in the mirror/data tree."""
     bundle = get_runtime_bundle()
     data_dir = bundle["data_dir"]
-    browser_workspace = bundle["browser_workspace"]
     mirror_manager = bundle["mirror_manager"]
     variant = request.args.get("variant", "thumb")
 
@@ -1315,120 +1790,90 @@ def save_label():
         detection_index = int(data.get("detection_index"))
         assigned_label = data.get("assigned_label")
         status = data.get("status", "confirmed")
+        suggested_label = data.get("suggested_label")
 
         if not image_path:
             return jsonify({"error": "Missing image_path"}), 400
 
-        # Initialize managers
-        metadata_manager = DetectionMetadata(output_dir)
-        label_manager = LabelManager(output_dir)
-
-        # Get detection metadata
-        detection_record = metadata_manager.get_detections(os.path.join(output_dir, image_path))
-        if not detection_record or not detection_record.get("detections"):
-            return jsonify({"error": "No detection data found"}), 404
-
-        detections = detection_record["detections"]
-        if detection_index >= len(detections):
-            return jsonify({"error": "Invalid detection index"}), 400
-
-        detection = detections[detection_index]
-        
-        # Check if label already exists
-        existing_labels = label_manager.get_labels_for_image(os.path.join(output_dir, image_path))
-        existing_label = None
-        
-        for label in existing_labels:
-            if label["detection_index"] == detection_index:
-                existing_label = label
-                break
-
-        if existing_label:
-            # Update existing label
-            if status == "pending":
-                label_manager.delete_label(existing_label["id"])
-            elif status == "rejected":
-                label_manager.update_label_status(existing_label["id"], "rejected")
-            elif assigned_label:
-                # Update with new label
-                label_manager.update_label(existing_label["id"], assigned_label=assigned_label, status="confirmed")
-        else:
-            # Create new label
-            if status == "pending":
-                return jsonify({"success": True, "export_dir": label_manager.rebuild_named_exports()})
-            if status != "rejected" and assigned_label:
-                label_manager.add_label(
-                    image_path=os.path.join(output_dir, image_path),
-                    detection_index=detection_index,
-                    assigned_label=assigned_label,
-                    detected_class=detection["class_name"],
-                    bbox=detection["bbox"],
-                    crop_path=detection.get("crop_path"),
-                    status="confirmed"
-                )
-            elif status == "rejected":
-                label_manager.add_label(
-                    image_path=os.path.join(output_dir, image_path),
-                    detection_index=detection_index,
-                    assigned_label="",
-                    detected_class=detection["class_name"],
-                    bbox=detection["bbox"],
-                    crop_path=detection.get("crop_path"),
-                    status="rejected"
-                )
-
-        export_dir = label_manager.rebuild_named_exports()
-
-        if status == "confirmed" and assigned_label:
-            bundle = get_runtime_bundle()
-            subject_type = get_subject_group(detection.get("class_name", ""))
-            asset_payload = resolve_detection_asset_urls(
-                mirror_manager=bundle["mirror_manager"],
-                source_dir=bundle["source_dir"],
-                data_dir=bundle["data_dir"],
-                browser_workspace=bundle["browser_workspace"],
+        return jsonify(
+            persist_label_update(
+                output_dir=output_dir,
                 image_path=image_path,
-                crop_path=detection.get("crop_path"),
-                bbox=detection.get("bbox"),
-                subject_type=subject_type,
-                identity_hint=assigned_label,
+                detection_index=detection_index,
+                assigned_label=assigned_label,
+                status=status,
+                suggested_label=suggested_label,
             )
-            embedding_path = Path(asset_payload["embedding_path"]) if asset_payload.get("embedding_path") else None
-            if embedding_path is not None:
-                bundle["intelligence_core"].learn_from_label(
-                    relative_path=f"{image_path}#{detection_index}",
-                    image_path=embedding_path,
-                    identity_label=assigned_label,
-                    subject_type=subject_type,
-                    metadata={
-                        "preview_url": asset_payload.get("candidate_image_url"),
-                        "full_url": asset_payload.get("candidate_full_url"),
-                        "image_path": image_path,
-                    },
-                    human_verified=True,
-                    schedule_fine_tune=False,
-                )
-
-        invalidate_runtime_caches()
-
-        return jsonify({"success": True, "export_dir": export_dir})
+        )
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/label/batch", methods=["POST"])
+def save_label_batch():
+    """Persist multiple detection labels in one request."""
+    if len(sys.argv) < 3:
+        return jsonify({"error": "Missing directory arguments"}), 400
+
+    output_dir = sys.argv[2]
+    if not is_safe_path(os.getcwd(), output_dir):
+        return jsonify({"error": "Invalid directory paths"}), 400
+
+    try:
+        data = request.get_json() or {}
+        items = data.get("items") or []
+        if not items:
+            return jsonify({"error": "Missing batch items"}), 400
+
+        applied = []
+        for item in items:
+            image_path = item.get("image_path")
+            detection_index = int(item.get("detection_index"))
+            assigned_label = item.get("assigned_label")
+            status = item.get("status", "confirmed")
+            suggested_label = item.get("suggested_label")
+            if not image_path:
+                return jsonify({"error": "Each batch item must include image_path"}), 400
+
+            persist_label_update(
+                output_dir=output_dir,
+                image_path=image_path,
+                detection_index=detection_index,
+                assigned_label=assigned_label,
+                status=status,
+                rebuild_exports=False,
+                invalidate_caches=False,
+                suggested_label=suggested_label,
+            )
+            applied.append({"image_path": image_path, "detection_index": detection_index, "status": status})
+
+        export_dir = LabelManager(output_dir).rebuild_named_exports()
+        invalidate_runtime_caches()
+        return jsonify({"success": True, "count": len(applied), "items": applied, "export_dir": export_dir})
+    except Exception as exc:
+        LOGGER.exception("Batch label save failed")
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.errorhandler(404)
-def not_found(error):
+def not_found(_error):
+    """Return a simple body for missing routes and assets."""
+
     return "File not found", 404
 
 
 @app.errorhandler(403)
-def forbidden(error):
+def forbidden(_error):
+    """Return a simple body for rejected file access attempts."""
+
     return "Access forbidden", 403
 
 
 @app.errorhandler(500)
-def internal_error(error):
+def internal_error(_error):
+    """Return a simple body for uncaught server-side failures."""
+
     return "Internal server error", 500
 
 
@@ -1438,20 +1883,20 @@ if __name__ == "__main__":
         print("Example: python web_ui.py ./working_dir ./sorted_output")
         sys.exit(1)
 
-    input_dir = sys.argv[1]
-    output_dir = sys.argv[2]
+    cli_input_dir = sys.argv[1]
+    cli_output_dir = sys.argv[2]
 
-    if not os.path.exists(input_dir):
-        print(f"Error: Input directory '{input_dir}' does not exist.")
+    if not os.path.exists(cli_input_dir):
+        print(f"Error: Input directory '{cli_input_dir}' does not exist.")
         sys.exit(1)
 
-    if not os.path.exists(output_dir):
-        print(f"Error: Output directory '{output_dir}' does not exist.")
+    if not os.path.exists(cli_output_dir):
+        print(f"Error: Output directory '{cli_output_dir}' does not exist.")
         sys.exit(1)
 
     print("Starting PhotoFinder Web UI...")
-    print(f"Working directory: {input_dir}")
-    print(f"Output directory: {output_dir}")
+    print(f"Working directory: {cli_input_dir}")
+    print(f"Output directory: {cli_output_dir}")
     print("Open http://localhost:5000 in your browser")
 
     # Run in development mode with security considerations

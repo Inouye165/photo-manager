@@ -1,3 +1,5 @@
+"""Regression tests for mirror workspace isolation and derivative generation."""
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +10,11 @@ from src.mirror_manager import CropRequest, MirrorConfig, MirrorManager
 
 
 class TestMirrorManager(unittest.TestCase):
+    """Verify source isolation and mirror artifact placement guarantees."""
+
     def test_sync_and_derivatives_stay_in_mirror(self):
+        """Source sync and derived artifacts should stay inside the mirror workspace."""
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             source_dir = root / "source_originals"
@@ -37,6 +43,8 @@ class TestMirrorManager(unittest.TestCase):
             self.assertEqual(len(list(source_dir.rglob("*"))), 2)
 
     def test_source_and_mirror_must_be_different(self):
+        """Mirror configuration should reject identical source and mirror roots."""
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             with self.assertRaises(ValueError):
