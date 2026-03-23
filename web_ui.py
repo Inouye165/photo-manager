@@ -8,6 +8,7 @@ import os
 import sys
 import logging
 import json
+import re
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -405,6 +406,19 @@ def build_external_preview_url(mirror_manager: MirrorManager, browser_workspace:
     return build_mirror_url(browser_workspace, derivative_path)
 
 
+def get_display_image_size(image_path: Optional[Path]) -> tuple[Optional[int], Optional[int]]:
+    """Return the EXIF-corrected display dimensions for an image path."""
+    if image_path is None or not image_path.exists() or not image_path.is_file():
+        return None, None
+
+    try:
+        with Image.open(image_path) as opened_image:
+            image = ImageOps.exif_transpose(opened_image)
+            return image.size
+    except Exception:
+        return None, None
+
+
 def resolve_detection_asset_urls(
     *,
     mirror_manager: MirrorManager,
@@ -420,6 +434,8 @@ def resolve_detection_asset_urls(
     """Build mirror-backed candidate URLs and an embedding-ready image path."""
     source_relative, source_absolute = resolve_source_asset(source_dir, data_dir, image_path)
     crop_absolute = resolve_existing_asset(data_dir, crop_path)
+    display_source = source_absolute or resolve_existing_asset(data_dir, image_path)
+    display_width, display_height = get_display_image_size(display_source)
 
     if source_relative and bbox:
         crop_artifact = mirror_manager.materialize_crop(
@@ -437,18 +453,24 @@ def resolve_detection_asset_urls(
     embedding_path = crop_absolute or source_absolute
 
     if crop_absolute is not None:
+        crop_cache_key = normalize_relative_path(crop_path)
+        if not crop_cache_key:
+            try:
+                crop_cache_key = crop_absolute.resolve().relative_to(browser_workspace.resolve()).as_posix()
+            except ValueError:
+                crop_cache_key = crop_absolute.name
         candidate_image_url = build_external_preview_url(
             mirror_manager,
             browser_workspace,
             crop_absolute,
-            f"candidate/{normalize_relative_path(image_path) or 'image'}",
+            f"candidate/{crop_cache_key or normalize_relative_path(image_path) or 'image'}",
             "thumb",
         )
         candidate_full_url = build_external_preview_url(
             mirror_manager,
             browser_workspace,
             crop_absolute,
-            f"candidate/{normalize_relative_path(image_path) or 'image'}",
+            f"candidate/{crop_cache_key or normalize_relative_path(image_path) or 'image'}",
             "full",
         )
     elif source_relative:
@@ -460,7 +482,31 @@ def resolve_detection_asset_urls(
         "candidate_full_url": candidate_full_url,
         "embedding_path": str(embedding_path) if embedding_path else None,
         "source_relative_path": source_relative,
+        "source_width": display_width,
+        "source_height": display_height,
     }
+
+
+def is_identity_candidate_viable(
+    bbox: Optional[list[int]],
+    source_width: Optional[int],
+    source_height: Optional[int],
+    border_margin_ratio: float = 0.03,
+) -> bool:
+    """Reject detections clipped against image borders; they are poor identity-label candidates."""
+    if not bbox or source_width is None or source_height is None:
+        return True
+
+    x1, y1, x2, y2 = (int(value) for value in bbox)
+    margin_x = max(1, int(source_width * border_margin_ratio))
+    margin_y = max(1, int(source_height * border_margin_ratio))
+
+    touches_left = x1 <= margin_x
+    touches_right = x2 >= source_width - margin_x
+    touches_top = y1 <= margin_y
+    touches_bottom = y2 >= source_height - margin_y
+
+    return not (touches_left or touches_right or touches_top or touches_bottom)
 
 
 def get_lab_cache_key(output_dir: str) -> tuple[str, int | None, int | None]:
@@ -518,72 +564,24 @@ def organize_images_by_category(base_dir: str) -> Dict[str, List[Dict[str, str]]
     if not os.path.exists(base_dir):
         return categories
 
-    # Get files from each category directory
     people_dir = os.path.join(base_dir, "people")
     animals_dir = os.path.join(base_dir, "animals")
     others_dir = os.path.join(base_dir, "others")
 
-    people_files = {f["filename"] for f in get_image_files(people_dir)}
-    animals_files = {f["filename"] for f in get_image_files(animals_dir)}
-    others_files = {f["filename"] for f in get_image_files(others_dir)}
+    people_files = {item["filename"]: item for item in get_image_files(people_dir)}
+    animals_files = {item["filename"]: item for item in get_image_files(animals_dir)}
+    others_files = {item["filename"]: item for item in get_image_files(others_dir)}
 
-    # Get all files in base directory and subdirectories (excluding _debug_boxes)
-    all_files = []
-    for root, dirs, files in os.walk(base_dir):
-        # Skip _debug_boxes directory
-        dirs[:] = [d for d in dirs if d != "_debug_boxes"]
-        for file in files:
-            if is_allowed_file(file):
-                file_path = os.path.join(root, file)
-                if os.path.isfile(file_path):
-                    size = os.path.getsize(file_path)
-                    all_files.append({
-                        "filename": file,
-                        "path": file_path,
-                        "size": format_size(size)
-                    })
+    both_names = sorted(set(people_files) & set(animals_files), key=str.lower)
+    people_only_names = sorted(set(people_files) - set(both_names), key=str.lower)
+    animal_only_names = sorted(set(animals_files) - set(both_names), key=str.lower)
+    other_names = sorted(set(others_files), key=str.lower)
 
-    # Sort by filename
-    all_files.sort(key=lambda x: x["filename"].lower())
-
-    # Get working directory files (files in root of working_dir, not in subfolders)
-    working_files = []
-    for file in os.listdir(base_dir):
-        file_path = os.path.join(base_dir, file)
-        if os.path.isfile(file_path) and is_allowed_file(file):
-            size = os.path.getsize(file_path)
-            working_files.append({
-                "filename": file,
-                "path": file_path,
-                "size": format_size(size)
-            })
-    working_files.sort(key=lambda x: x["filename"].lower())
-
-    # Categorize files (only from subdirectories, not root working_dir files)
-    working_file_names = {f["filename"] for f in working_files}
-
-    for file_info in all_files:
-        filename = file_info["filename"]
-        # Skip files that are in the root working directory
-        if filename in working_file_names:
-            continue
-
-        in_people = filename in people_files
-        in_animals = filename in animals_files
-        in_others = filename in others_files
-
-        if in_people and in_animals:
-            categories["both"].append(file_info)
-        elif in_people:
-            categories["people"].append(file_info)
-        elif in_animals:
-            categories["animals"].append(file_info)
-        elif in_others:
-            categories["others"].append(file_info)
-        else:
-            categories["none"].append(file_info)
-
-    categories["working_dir"] = working_files
+    categories["people"] = [people_files[name] for name in people_only_names]
+    categories["animals"] = [animals_files[name] for name in animal_only_names]
+    categories["both"] = [people_files.get(name) or animals_files[name] for name in both_names]
+    categories["others"] = [others_files[name] for name in other_names]
+    categories["working_dir"] = get_image_files(base_dir)
 
     return categories
 
@@ -592,32 +590,32 @@ def get_identity_stage(sample_count: int) -> Dict[str, object]:
     """Translate label counts into a more human progress story."""
     if sample_count >= 12:
         return {
-            "title": "Dialed In",
-            "summary": "This identity has enough examples to feel stable.",
+            "title": "Ready",
+            "summary": "This person or pet has enough examples to be reliable.",
             "tone": "dialed",
             "target": None,
             "progress": 100,
         }
     if sample_count >= 6:
         return {
-            "title": "Locking In",
-            "summary": "The model should start making consistent suggestions soon.",
+            "title": "Looking Good",
+            "summary": "A few more examples should make suggestions much more consistent.",
             "tone": "locking",
             "target": 12,
             "progress": int((sample_count / 12) * 100),
         }
     if sample_count >= 3:
         return {
-            "title": "Warming Up",
-            "summary": "There is enough signal to start recognizing patterns.",
+            "title": "Getting Started",
+            "summary": "The app has enough examples to start spotting this subject again.",
             "tone": "warming",
             "target": 6,
             "progress": int((sample_count / 6) * 100),
         }
 
     return {
-        "title": "Spark",
-        "summary": "The identity exists, but it still needs more examples.",
+        "title": "Needs More Photos",
+        "summary": "This label exists, but it still needs a few more examples.",
         "tone": "spark",
         "target": 3,
         "progress": int((sample_count / 3) * 100) if sample_count else 0,
@@ -659,7 +657,7 @@ def build_identity_collections(label_manager: LabelManager) -> List[Dict[str, ob
 
 
 def build_lab_insights(detections: List[Dict[str, object]], identity_collections: List[Dict[str, object]]) -> Dict[str, object]:
-    """Create product guidance for the current labeling session."""
+    """Create plain-language guidance for the current labeling session."""
     pending_detections = [detection for detection in detections if detection["status"] == "pending"]
     focus_detection = pending_detections[0] if pending_detections else None
     ready_identities = sum(1 for identity in identity_collections if identity["sample_count"] >= 3)
@@ -667,16 +665,16 @@ def build_lab_insights(detections: List[Dict[str, object]], identity_collections
     likely_matches = sum(1 for detection in pending_detections if detection.get("review_bucket") == "likely")
 
     if strongest_identity:
-        momentum = f"{strongest_identity['name']} leads with {strongest_identity['sample_count']} labeled samples."
+        momentum = f"{strongest_identity['name']} has the most confirmed examples right now: {strongest_identity['sample_count']}."
     else:
-        momentum = "Start by locking in a few obvious faces or pets to create your first identity spark."
+        momentum = "Start with a few obvious people or pets so the app has something solid to learn from."
 
     if likely_matches:
-        action_prompt = f"{likely_matches} likely matches are ready for one-click confirmation."
+        action_prompt = f"{likely_matches} detections already look like good matches and can be confirmed quickly."
     elif pending_detections:
         action_prompt = f"{len(pending_detections)} detections are still waiting for a name."
     else:
-        action_prompt = "Everything visible is labeled. The next move is building identity strength with more varied examples."
+        action_prompt = "Everything on screen is labeled. Add more examples if you want stronger matching later."
 
     suggestion_count = sum(1 for detection in pending_detections if detection.get("suggestion"))
 
@@ -698,12 +696,138 @@ def serialize_gallery_items(items: List[Dict[str, str]], base_dir: str, route_pr
         serialized.append(
             {
                 "filename": item["filename"],
+                "relativePath": relative_path,
+                "inspectPath": relative_path,
                 "size": item["size"],
                 "url": f"{route_prefix}/{relative_path}?variant=thumb",
             }
         )
 
     return serialized
+
+
+def find_detection_record_for_image(metadata_manager: DetectionMetadata, image_reference: str) -> Optional[Dict[str, object]]:
+    """Find a detection record by exact path first, then by filename as a fallback for category copies."""
+    normalized_reference = normalize_relative_path(image_reference)
+    if not normalized_reference:
+        return None
+
+    matches_by_name: List[Dict[str, object]] = []
+    reference_name = Path(normalized_reference).name.lower()
+
+    for record in metadata_manager.get_images_with_detections():
+        record_path = normalize_relative_path(record.get("image_path"))
+        debug_path = normalize_relative_path(record.get("debug_image_path"))
+        if record_path == normalized_reference or debug_path == normalized_reference:
+            return record
+        if record_path and Path(record_path).name.lower() == reference_name:
+            matches_by_name.append(record)
+
+    if not matches_by_name:
+        return None
+
+    matches_by_name.sort(key=lambda item: normalize_relative_path(item.get("image_path")) or "")
+    return matches_by_name[0]
+
+
+def build_image_inspection_payload(image_reference: str) -> Dict[str, object]:
+    """Build a full-image review payload with every detection for one image."""
+    bundle = get_runtime_bundle()
+    source_dir = bundle["source_dir"]
+    data_dir = bundle["data_dir"]
+    browser_workspace = bundle["browser_workspace"]
+    mirror_manager = bundle["mirror_manager"]
+
+    metadata_manager = DetectionMetadata(str(data_dir))
+    label_manager = LabelManager(str(data_dir))
+    normalized_reference = normalize_relative_path(image_reference)
+    if not normalized_reference:
+        raise ValueError("Missing image path")
+
+    record = find_detection_record_for_image(metadata_manager, normalized_reference)
+
+    if record is None:
+        source_relative, source_absolute = resolve_source_asset(source_dir, data_dir, normalized_reference)
+        if not source_relative or source_absolute is None:
+            raise FileNotFoundError("Image not found")
+
+        original_url = build_source_preview_url(mirror_manager, browser_workspace, source_relative, "full")
+        source_width, source_height = get_display_image_size(source_absolute)
+        return {
+            "imagePath": source_relative,
+            "requestedPath": normalized_reference,
+            "filename": Path(source_relative).name,
+            "originalPreviewUrl": original_url,
+            "originalFullUrl": original_url,
+            "sourceWidth": source_width,
+            "sourceHeight": source_height,
+            "detections": [],
+        }
+
+    image_path = normalize_relative_path(record.get("image_path")) or normalized_reference
+    source_relative, source_absolute = resolve_source_asset(source_dir, data_dir, image_path)
+    display_source = source_absolute or resolve_existing_asset(data_dir, image_path)
+    source_width, source_height = get_display_image_size(display_source)
+
+    if source_relative:
+        original_preview_url = build_source_preview_url(mirror_manager, browser_workspace, source_relative, "full")
+        original_full_url = original_preview_url
+    elif display_source is not None:
+        original_preview_url = build_external_preview_url(
+            mirror_manager,
+            browser_workspace,
+            display_source,
+            f"inspect/{image_path}",
+            "full",
+        )
+        original_full_url = original_preview_url
+    else:
+        original_preview_url = None
+        original_full_url = None
+
+    existing_labels = label_manager.get_labels_for_image(os.path.join(str(data_dir), image_path))
+    labels_by_index = {label["detection_index"]: label for label in existing_labels}
+    detections = []
+
+    for detection_index, detection in enumerate(record.get("detections") or []):
+        existing_label = labels_by_index.get(detection_index)
+        subject_type = "people" if get_subject_group(detection.get("class_name")) == "person" else "animals"
+        asset_payload = resolve_detection_asset_urls(
+            mirror_manager=mirror_manager,
+            source_dir=source_dir,
+            data_dir=data_dir,
+            browser_workspace=browser_workspace,
+            image_path=image_path,
+            crop_path=detection.get("crop_path"),
+            bbox=detection.get("bbox"),
+            subject_type=subject_type,
+            identity_hint=existing_label.get("assigned_label") if existing_label else None,
+        )
+
+        detections.append(
+            {
+                "detectionIndex": detection_index,
+                "detectedClass": detection.get("class_name") or "unknown",
+                "confidence": detection.get("confidence") or 0,
+                "bbox": [int(value) for value in (detection.get("bbox") or [])],
+                "cropPreviewUrl": asset_payload.get("candidate_image_url"),
+                "cropFullUrl": asset_payload.get("candidate_full_url"),
+                "assignedLabel": existing_label.get("assigned_label") if existing_label else None,
+                "status": existing_label.get("status") if existing_label else "pending",
+                "labelId": existing_label.get("id") if existing_label else None,
+            }
+        )
+
+    return {
+        "imagePath": image_path,
+        "requestedPath": normalized_reference,
+        "filename": Path(image_path).name,
+        "originalPreviewUrl": original_preview_url,
+        "originalFullUrl": original_full_url,
+        "sourceWidth": source_width,
+        "sourceHeight": source_height,
+        "detections": detections,
+    }
 
 
 def get_subject_group(detected_class: str) -> str:
@@ -955,6 +1079,34 @@ def infer_semantic_search_class_name(query: str, label_manager: LabelManager) ->
 
     if len(matched_classes) == 1:
         return next(iter(matched_classes))
+
+    detected_class_aliases = {
+        "person": {"person", "people", "human", "humans", "man", "men", "woman", "women", "boy", "boys", "girl", "girls"},
+        "bird": {"bird", "birds", "owl", "owls"},
+        "cat": {"cat", "cats", "kitten", "kittens"},
+        "dog": {"dog", "dogs", "puppy", "puppies"},
+        "horse": {"horse", "horses"},
+        "sheep": {"sheep", "lamb", "lambs"},
+        "cow": {"cow", "cows", "cattle"},
+        "bison": {"bison", "buffalo"},
+        "bison calf": {"calf", "calves", "bison calf", "baby bison"},
+        "goat": {"goat", "goats"},
+        "deer": {"deer"},
+        "elk": {"elk"},
+        "moose": {"moose"},
+        "yak": {"yak", "yaks"},
+        "ox": {"ox", "oxen"},
+        "elephant": {"elephant", "elephants"},
+        "bear": {"bear", "bears"},
+        "zebra": {"zebra", "zebras"},
+        "giraffe": {"giraffe", "giraffes"},
+    }
+
+    query_tokens = set(re.findall(r"[a-z]+", normalized_query))
+    for detected_class, aliases in detected_class_aliases.items():
+        if query_tokens & aliases:
+            return detected_class
+
     return None
 
 
@@ -1014,6 +1166,12 @@ def build_identity_tasks(limit: int = 120) -> Dict[str, object]:
             embedding_path = asset_payload.get("embedding_path")
             if not embedding_path:
                 continue
+            if not is_identity_candidate_viable(
+                detection.get("bbox"),
+                asset_payload.get("source_width"),
+                asset_payload.get("source_height"),
+            ):
+                continue
 
             task = intelligence_core.propose_identity(
                 relative_path=f"{image_rel_path}#{detection_index}",
@@ -1028,6 +1186,8 @@ def build_identity_tasks(limit: int = 120) -> Dict[str, object]:
                 "image_path": image_rel_path,
                 "detection_index": detection_index,
                 "bbox": detection.get("bbox"),
+                "source_width": asset_payload.get("source_width"),
+                "source_height": asset_payload.get("source_height"),
                 "crop_path": normalize_relative_path(detection.get("crop_path")),
                 "detected_class": detected_class,
                 "confidence": detection.get("confidence"),
@@ -1300,14 +1460,16 @@ def build_vault_browser_payload(source_dir: str | Path, data_dir: str | Path) ->
 
     source_path = Path(source_dir).resolve()
     data_path = Path(data_dir).resolve()
+    browser_workspace = data_path if source_path != data_path else data_path.parent / f"{data_path.name}__mirror_workspace"
     mirror_manager = MirrorManager(
         MirrorConfig(
             source_originals=source_path,
-            mirror_workspace=data_path if source_path != data_path else data_path.parent / f"{data_path.name}__mirror_workspace",
+            mirror_workspace=browser_workspace,
         )
     )
     report = mirror_manager.sync_source_index()
     metadata_manager = DetectionMetadata(str(data_path))
+    label_manager = LabelManager(str(data_path))
     detection_records = metadata_manager.get_detections()
 
     detection_by_hash: Dict[str, Dict[str, object]] = {}
@@ -1361,12 +1523,73 @@ def build_vault_browser_payload(source_dir: str | Path, data_dir: str | Path) ->
         for folder_path, items in sorted(folders.items(), key=lambda item: (item[0] != "root", item[0].lower()))
     ]
 
+    tagged_groups: Dict[str, list[Dict[str, object]]] = {}
+    for label_record in label_manager.get_all_labels(status="confirmed"):
+        assigned_label = str(label_record.get("assigned_label") or "").strip()
+        image_path = normalize_relative_path(label_record.get("image_path"))
+        if not assigned_label or not image_path:
+            continue
+
+        detection_record = detection_records.get(image_path) or detection_by_name.get(Path(image_path).name)
+        detections = list(detection_record.get("detections") or []) if detection_record else []
+        image_metadata = dict(detection_record.get("metadata") or {}) if detection_record else {}
+        detection_index = int(label_record.get("detection_index", 0))
+        detection = detections[detection_index] if 0 <= detection_index < len(detections) else {}
+
+        detected_class = str(label_record.get("detected_class") or detection.get("class_name") or "").strip().lower()
+        asset_payload = resolve_detection_asset_urls(
+            mirror_manager=mirror_manager,
+            source_dir=source_path,
+            data_dir=data_path,
+            browser_workspace=browser_workspace,
+            image_path=image_path,
+            crop_path=label_record.get("crop_path") or detection.get("crop_path"),
+            bbox=label_record.get("bbox") or detection.get("bbox"),
+            subject_type=get_subject_lane(detected_class),
+            identity_hint=assigned_label,
+        )
+        source_relative = normalize_relative_path(asset_payload.get("source_relative_path"))
+
+        tagged_groups.setdefault(assigned_label, []).append(
+            {
+                "labelId": label_record.get("id"),
+                "assignedLabel": assigned_label,
+                "filename": Path(image_path).name,
+                "imagePath": image_path,
+                "detectionIndex": detection_index,
+                "detectedClass": detected_class,
+                "capturedAt": image_metadata.get("captured_at"),
+                "previewUrl": asset_payload.get("candidate_image_url") or f"/image/{quote(image_path, safe='/')}?variant=thumb",
+                "fullUrl": asset_payload.get("candidate_full_url") or f"/image/{quote(image_path, safe='/')}?variant=full",
+                "originalUrl": f"/working_dir/{quote(source_relative, safe='/')}?variant=full" if source_relative else f"/image/{quote(image_path, safe='/')}?variant=full",
+            }
+        )
+
+    tagged_payload = [
+        {
+            "label": label,
+            "count": len(items),
+            "items": sorted(
+                items,
+                key=lambda item: (
+                    str(item.get("filename") or "").lower(),
+                    int(item.get("detectionIndex") or 0),
+                ),
+            ),
+        }
+        for label, items in sorted(tagged_groups.items(), key=lambda item: item[0].lower())
+    ]
+
     unique_hash_count = len({record.sha256 for record in report.records})
     return {
         "sourceCount": len(report.records),
         "uniqueHashCount": unique_hash_count,
         "duplicateHashGroups": max(0, len(report.records) - unique_hash_count),
         "folders": folder_payload,
+        "tagged": {
+            "count": sum(group["count"] for group in tagged_payload),
+            "groups": tagged_payload,
+        },
     }
 
 
@@ -1495,7 +1718,14 @@ def persist_label_update(
                 status="confirmed" if status == "confirmed" else "rejected",
             )
 
-    export_dir = label_manager.rebuild_named_exports() if rebuild_exports else str(Path(output_dir) / "_sorted_by_name")
+    export_dir = str(Path(output_dir) / "_sorted_by_name")
+    export_warning = None
+    if rebuild_exports:
+        try:
+            export_dir = label_manager.rebuild_named_exports()
+        except Exception as exc:
+            LOGGER.warning("Named export rebuild failed after label update: %s", exc)
+            export_warning = str(exc)
 
     bundle = get_runtime_bundle()
     subject_type = get_subject_group(detection.get("class_name", ""))
@@ -1560,7 +1790,94 @@ def persist_label_update(
     if invalidate_caches:
         invalidate_runtime_caches()
 
-    return {"success": True, "export_dir": export_dir}
+    return {"success": True, "export_dir": export_dir, "export_warning": export_warning}
+
+
+def _detection_class_search(query: str, limit: int, date_range: Optional[str] = None, class_name_filter: Optional[str] = None) -> Dict[str, object]:
+    """Fallback search: match detections by YOLO class name or confirmed label when the vector index is empty."""
+    bundle = get_runtime_bundle()
+    source_dir = bundle["source_dir"]
+    data_dir = bundle["data_dir"]
+    browser_workspace = bundle["browser_workspace"]
+    mirror_manager = bundle["mirror_manager"]
+
+    normalized_query = query.strip().lower()
+    strict_class_filter = str(class_name_filter or "").strip().lower() or None
+    metadata_manager = DetectionMetadata(str(data_dir))
+    label_manager = LabelManager(str(data_dir))
+    start_date, end_date = parse_date_range(date_range)
+    results: List[Dict[str, object]] = []
+    images_scanned = 0
+    detections_scanned = 0
+
+    for record in metadata_manager.get_images_with_detections():
+        image_rel_path = to_web_path(record["image_path"])
+        image_metadata = dict(record.get("metadata") or {})
+        images_scanned += 1
+
+        if start_date or end_date:
+            if not captured_at_in_range(image_metadata.get("captured_at"), start_date, end_date):
+                continue
+
+        for det_index, detection in enumerate(record.get("detections", [])):
+            detections_scanned += 1
+            det_class = str(detection.get("class_name") or "").strip().lower()
+
+            # Check if class name or any confirmed label matches
+            existing_labels = label_manager.get_labels_for_image(os.path.join(str(data_dir), image_rel_path))
+            det_label = next(
+                (str(lbl.get("assigned_label") or "") for lbl in existing_labels if lbl.get("detection_index") == det_index),
+                None,
+            )
+            match_text = " ".join(filter(None, [det_class, det_label or ""])).lower()
+
+            if strict_class_filter:
+                if det_class != strict_class_filter:
+                    continue
+            elif normalized_query not in match_text:
+                continue
+
+            subject_lane = get_subject_lane(det_class)
+            asset_payload = resolve_detection_asset_urls(
+                mirror_manager=mirror_manager,
+                source_dir=source_dir,
+                data_dir=data_dir,
+                browser_workspace=browser_workspace,
+                image_path=image_rel_path,
+                crop_path=detection.get("crop_path"),
+                bbox=detection.get("bbox"),
+                subject_type=subject_lane,
+                identity_hint=det_label or det_class,
+            )
+
+            results.append({
+                "record_id": build_detection_record_id(image_rel_path, det_index),
+                "label": det_label or det_class,
+                "score": 1.0,
+                "confidence": round(float(detection.get("confidence", 0)) * 100, 1),
+                "subject_type": det_class,
+                "detected_class": det_class or None,
+                "relative_path": f"{image_rel_path}#{det_index}",
+                "image_path": image_rel_path,
+                "crop_path": normalize_relative_path(detection.get("crop_path")),
+                "preview_url": asset_payload.get("candidate_image_url"),
+                "full_url": asset_payload.get("candidate_full_url"),
+                "metadata": {
+                    "image_path": image_rel_path,
+                    "crop_path": normalize_relative_path(detection.get("crop_path")),
+                    "captured_at": image_metadata.get("captured_at"),
+                    "file_hash": image_metadata.get("file_hash"),
+                    "confidence": detection.get("confidence"),
+                    "detected_class": det_class,
+                },
+            })
+
+            if len(results) >= limit:
+                break
+        if len(results) >= limit:
+            break
+
+    return {"results": results, "images_scanned": images_scanned, "detections_scanned": detections_scanned}
 
 
 def build_semantic_search_payload(
@@ -1569,7 +1886,7 @@ def build_semantic_search_payload(
     class_name: Optional[str] = None,
     date_range: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Run semantic search against the live vector index and attach URLs."""
+    """Run semantic search against the live vector index, falling back to class-name matching."""
     bundle = get_runtime_bundle()
     label_manager = LabelManager(str(bundle["data_dir"]))
     bootstrap_intelligence_index(
@@ -1590,13 +1907,27 @@ def build_semantic_search_payload(
         class_name=class_name_filter,
     )
     results = [serialize_semantic_hit(hit, bundle) for hit in hits]
+    if not class_name_filter:
+        results = [result for result in results if float(result.get("confidence", 0)) > 0.0]
     if start_date or end_date:
         results = [result for result in results if captured_at_in_range(result.get("metadata", {}).get("captured_at"), start_date, end_date)]
+
+    # Fallback: when vector index has no results, search by YOLO class name
+    images_scanned = 0
+    detections_scanned = 0
+    if not results:
+        fallback = _detection_class_search(query, limit, date_range=date_range, class_name_filter=class_name_filter)
+        results = fallback["results"]
+        images_scanned = fallback["images_scanned"]
+        detections_scanned = fallback["detections_scanned"]
+
     return {
         "query": query,
         "class_name_filter": class_name_filter,
         "date_range": date_range,
         "results": results,
+        "images_scanned": images_scanned,
+        "detections_scanned": detections_scanned,
     }
 
 
@@ -1730,22 +2061,22 @@ def build_dashboard_payload(input_dir: str, output_dir: str) -> Dict[str, object
 
     lane_payload = {
         "working_dir": {
-            "title": "Original Photos",
+            "title": "Original photos",
             "count": len(categories["working_dir"]),
             "items": serialize_gallery_items(categories["working_dir"], input_dir, "/working_dir"),
         },
         "people": {
-            "title": "People Signals",
+            "title": "Photos with people",
             "count": len(categories["people"]) + len(categories["both"]),
-            "items": serialize_gallery_items(categories["people"], output_dir, "/image/people"),
+            "items": serialize_gallery_items(categories["people"], output_dir, "/image"),
         },
         "animals": {
-            "title": "Animal Signals",
+            "title": "Photos with animals",
             "count": len(categories["animals"]) + len(categories["both"]),
-            "items": serialize_gallery_items(categories["animals"], output_dir, "/image/animals"),
+            "items": serialize_gallery_items(categories["animals"], output_dir, "/image"),
         },
         "mixed": {
-            "title": "Mixed Scenes",
+            "title": "Photos with both",
             "count": len(categories["both"]),
             "items": serialize_gallery_items(categories["both"], output_dir, "/image"),
         },
@@ -1766,13 +2097,13 @@ def build_dashboard_payload(input_dir: str, output_dir: str) -> Dict[str, object
 
     return {
         "hero": {
-            "title": "Identity Atlas",
-            "summary": "A React-powered front door for growing named people and pet collections from your photo stream.",
+            "title": "Photo browser",
+            "summary": "Browse your originals, open any image, and label the people and animals you want to keep track of.",
             "momentum": collections_payload[0]["name"] if collections_payload else None,
         },
         "stats": {
             "originalCount": len(categories["working_dir"]),
-            "processedCount": len(categories["people"]) + len(categories["animals"]) + len(categories["both"]) + len(categories["none"]),
+            "processedCount": len(categories["people"]) + len(categories["animals"]) + len(categories["both"]) + len(categories["others"]) + len(categories["none"]),
             "identityCount": len(collections_payload),
             "peopleSignalCount": lane_payload["people"]["count"],
             "animalSignalCount": lane_payload["animals"]["count"],
@@ -1929,7 +2260,29 @@ def vault_browser_api():
     if not is_safe_path(os.getcwd(), input_dir) or not is_safe_path(os.getcwd(), output_dir):
         return jsonify({"error": "Invalid directory paths"}), 400
 
-    return jsonify(build_vault_browser_payload(input_dir, output_dir))
+    try:
+        return jsonify(build_vault_browser_payload(input_dir, output_dir))
+    except Exception as exc:
+        LOGGER.exception("Vault browser payload failed")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/image/inspect")
+def image_inspect_api():
+    """Return one image plus every stored detection for review in the browser."""
+    image_path = str(request.args.get("image_path") or "").strip()
+    if not image_path:
+        return jsonify({"error": "Missing image_path"}), 400
+
+    try:
+        return jsonify(build_image_inspection_payload(image_path))
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        LOGGER.exception("Image inspection payload failed")
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/lab")
@@ -2078,7 +2431,8 @@ def serve_mirror_asset(filename):
         safe_path = safe_join(str(browser_workspace), filename)
         if not os.path.exists(safe_path) or not os.path.isfile(safe_path):
             abort(404)
-        return send_file(safe_path, conditional=True, max_age=3600)
+        mimetype = "image/webp" if safe_path.endswith(".webp") else None
+        return send_file(safe_path, mimetype=mimetype, conditional=True, max_age=3600)
     except Exception:
         abort(500)
 
@@ -2233,9 +2587,15 @@ def save_label_batch():
             )
             applied.append({"image_path": image_path, "detection_index": detection_index, "status": status})
 
-        export_dir = LabelManager(output_dir).rebuild_named_exports()
+        export_dir = str(Path(output_dir) / "_sorted_by_name")
+        export_warning = None
+        try:
+            export_dir = LabelManager(output_dir).rebuild_named_exports()
+        except Exception as exc:
+            LOGGER.warning("Batch label export rebuild failed: %s", exc)
+            export_warning = str(exc)
         invalidate_runtime_caches()
-        return jsonify({"success": True, "count": len(applied), "items": applied, "export_dir": export_dir})
+        return jsonify({"success": True, "count": len(applied), "items": applied, "export_dir": export_dir, "export_warning": export_warning})
     except Exception as exc:
         LOGGER.exception("Batch label save failed")
         return jsonify({"error": str(exc)}), 500

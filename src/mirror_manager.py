@@ -16,7 +16,10 @@ from typing import Dict, Iterable, Literal, Optional
 from urllib.parse import quote
 
 from PIL import Image, ImageOps
+import pillow_heif
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+pillow_heif.register_heif_opener()
 
 from src.runtime_paths import count_writable_source_files, harden_source_vault
 
@@ -307,10 +310,16 @@ class MirrorManager:
                 image = image.convert("RGB")
 
             width, height = image.size
-            left = max(0, min(x1, width))
-            top = max(0, min(y1, height))
-            right = max(left + 1, min(x2, width))
-            bottom = max(top + 1, min(y2, height))
+            # Generous padding so crops include the full head/face for identification
+            box_w = x2 - x1
+            box_h = y2 - y1
+            pad_x = int(box_w * 0.5)
+            pad_top = int(box_h * 0.75)   # extra room above for faces
+            pad_bottom = int(box_h * 0.3)
+            left = max(0, min(x1 - pad_x, width))
+            top = max(0, min(y1 - pad_top, height))
+            right = max(left + 1, min(x2 + pad_x, width))
+            bottom = max(top + 1, min(y2 + pad_bottom, height))
 
             crop = image.crop((left, top, right, bottom))
             fitted = ImageOps.fit(

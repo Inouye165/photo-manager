@@ -8,6 +8,16 @@ import pillow_heif
 from PIL import Image, ImageOps
 
 try:
+    import clip
+    import torch
+
+    HAS_CLIP = True
+except ImportError:
+    HAS_CLIP = False
+    clip = None
+    torch = None
+
+try:
     from ultralytics import YOLO
 
     HAS_YOLO = True
@@ -16,6 +26,27 @@ except ImportError:
 
 pillow_heif.register_heif_opener()
 
+COARSE_ANIMAL_CLASSES = {"bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"}
+REFINED_ANIMAL_CLASSES = {"bison", "bison calf", "buffalo", "ox", "yak", "goat", "deer", "elk", "moose", "calf"}
+ALL_ANIMAL_CLASSES = COARSE_ANIMAL_CLASSES | REFINED_ANIMAL_CLASSES
+UNGULATE_RELABEL_SOURCE_CLASSES = {"sheep", "cow", "horse"}
+ANIMAL_LABEL_CANONICAL_MAP = {"buffalo": "bison"}
+UNGULATE_RELABEL_CANDIDATES = (
+    "bison",
+    "bison calf",
+    "buffalo",
+    "cow",
+    "calf",
+    "sheep",
+    "goat",
+    "ox",
+    "yak",
+    "deer",
+    "elk",
+    "moose",
+    "horse",
+)
+
 
 class ImageProcessor:
 
@@ -23,12 +54,88 @@ class ImageProcessor:
         self.laplacian_threshold = laplacian_threshold
         self.entropy_threshold = entropy_threshold
         self.yolo_model = None
+        self.clip_model = None
+        self.clip_preprocess = None
+        self.clip_text_features = None
+        self.clip_device = "cpu"
+        self._clip_attempted = False
         if HAS_YOLO:
             try:
                 # Load YOLOv8 model for object detection
                 self.yolo_model = YOLO("yolov8m.pt")  # Using medium model for better accuracy
             except Exception as e:
                 logging.error(f"Failed to load YOLO model: {e}")
+
+    def _ensure_clip_model(self) -> bool:
+        """Load CLIP lazily for open-vocabulary animal relabeling."""
+        if self.clip_model is not None and self.clip_preprocess is not None and self.clip_text_features is not None:
+            return True
+        if self._clip_attempted or not HAS_CLIP:
+            return False
+
+        self._clip_attempted = True
+        try:
+            self.clip_device = "cuda" if torch and torch.cuda.is_available() else "cpu"
+            self.clip_model, self.clip_preprocess = clip.load("ViT-B/32", device=self.clip_device)
+            prompts = [f"a photo of a {label}" for label in UNGULATE_RELABEL_CANDIDATES]
+            tokenized_prompts = clip.tokenize(prompts).to(self.clip_device)
+            with torch.no_grad():
+                self.clip_text_features = self.clip_model.encode_text(tokenized_prompts)
+                self.clip_text_features /= self.clip_text_features.norm(dim=-1, keepdim=True)
+            return True
+        except Exception as e:
+            logging.warning(f"Failed to load CLIP animal relabeler: {e}")
+            self.clip_model = None
+            self.clip_preprocess = None
+            self.clip_text_features = None
+            return False
+
+    def _crop_for_relabel(self, image: np.ndarray, bbox: List[int], padding_ratio: float = 0.08) -> Optional[Image.Image]:
+        """Extract a lightly padded PIL crop for zero-shot animal relabeling."""
+        x1, y1, x2, y2 = bbox
+        img_h, img_w = image.shape[:2]
+        pad_x = int((x2 - x1) * padding_ratio)
+        pad_y = int((y2 - y1) * padding_ratio)
+        left = max(0, x1 - pad_x)
+        top = max(0, y1 - pad_y)
+        right = min(img_w, x2 + pad_x)
+        bottom = min(img_h, y2 + pad_y)
+
+        crop = image[top:bottom, left:right]
+        if crop.size == 0:
+            return None
+
+        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(crop_rgb)
+
+    def _refine_animal_label(self, image: np.ndarray, bbox: List[int], coarse_label: str) -> str:
+        """Relabel sheep/cow/horse-like detections using CLIP zero-shot classification."""
+        normalized_label = str(coarse_label or "").strip().lower()
+        if normalized_label not in UNGULATE_RELABEL_SOURCE_CLASSES:
+            return normalized_label
+        if not self._ensure_clip_model():
+            return normalized_label
+
+        crop_image = self._crop_for_relabel(image, bbox)
+        if crop_image is None:
+            return normalized_label
+
+        try:
+            image_tensor = self.clip_preprocess(crop_image).unsqueeze(0).to(self.clip_device)
+            with torch.no_grad():
+                image_features = self.clip_model.encode_image(image_tensor)
+                image_features /= image_features.norm(dim=-1, keepdim=True)
+                probabilities = (100.0 * image_features @ self.clip_text_features.T).softmax(dim=-1)[0]
+
+            best_index = int(probabilities.argmax().item())
+            best_label = UNGULATE_RELABEL_CANDIDATES[best_index]
+            best_confidence = float(probabilities[best_index].item())
+            if best_confidence >= 0.45:
+                return ANIMAL_LABEL_CANONICAL_MAP.get(best_label, best_label)
+        except Exception as e:
+            logging.warning(f"Animal relabel failed for {coarse_label}: {e}")
+
+        return normalized_label
 
     def calculate_laplacian_variance(self, image: np.ndarray) -> float:
         """
@@ -110,9 +217,6 @@ class ImageProcessor:
             # YOLO predicts on BGR numpy arrays (cv2 format) natively without issues
             results = self.yolo_model(image, verbose=False, conf=0.25)
 
-            # Common COCO class names for animals
-            animal_classes = {"bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"}
-
             for r in results:
                 if r.boxes:
                     for cls, conf in zip(r.boxes.cls, r.boxes.conf):
@@ -122,7 +226,7 @@ class ImageProcessor:
 
                         if class_name == "person" and confidence > 0.5:
                             results_dict["has_person"] = True
-                        elif class_name in animal_classes and confidence > 0.4:
+                        elif class_name in COARSE_ANIMAL_CLASSES and confidence > 0.4:
                             results_dict["has_animal"] = True
             return results_dict
         except Exception as e:
@@ -142,7 +246,6 @@ class ImageProcessor:
             image = self._load_image(image_path)
             results = self.yolo_model(image, verbose=False, conf=confidence_threshold)
             
-            animal_classes = {"bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"}
             detections = []
             
             for r in results:
@@ -155,9 +258,14 @@ class ImageProcessor:
                         x1, y1, x2, y2 = map(int, box[:4])
                         
                         # Only include people and animals for labeling workflow
-                        if class_name == "person" or class_name in animal_classes:
+                        if class_name == "person" or class_name in COARSE_ANIMAL_CLASSES:
+                            refined_class_name = (
+                                self._refine_animal_label(image, [x1, y1, x2, y2], class_name)
+                                if class_name in COARSE_ANIMAL_CLASSES
+                                else class_name
+                            )
                             detection = {
-                                "class_name": class_name,
+                                "class_name": refined_class_name,
                                 "class_id": class_id,
                                 "confidence": confidence,
                                 "bbox": [x1, y1, x2, y2],
@@ -179,10 +287,17 @@ class ImageProcessor:
             image = self._load_image(image_path)
             x1, y1, x2, y2 = bbox
             
-            # Ensure bbox is within image bounds
-            h, w = image.shape[:2]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
+            # Generous padding so crops include the full head/face for identification
+            img_h, img_w = image.shape[:2]
+            box_w = x2 - x1
+            box_h = y2 - y1
+            pad_x = int(box_w * 0.5)
+            pad_top = int(box_h * 0.75)   # extra room above for faces
+            pad_bottom = int(box_h * 0.3)
+            x1 = max(0, x1 - pad_x)
+            y1 = max(0, y1 - pad_top)
+            x2 = min(img_w, x2 + pad_x)
+            y2 = min(img_h, y2 + pad_bottom)
             
             # Crop the image
             crop = image[y1:y2, x1:x2]
@@ -222,7 +337,6 @@ class ImageProcessor:
             annotated_image = image.copy()
 
             results = self.yolo_model(image, verbose=False, conf=confidence_threshold)
-            animal_classes = {"bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"}
             has_detections = False
 
             for r in results:
@@ -234,11 +348,16 @@ class ImageProcessor:
                         confidence = conf.item()
 
                         x1, y1, x2, y2 = map(int, box[:4])
+                        display_class_name = (
+                            self._refine_animal_label(image, [x1, y1, x2, y2], class_name)
+                            if class_name in COARSE_ANIMAL_CLASSES
+                            else class_name
+                        )
 
                         if class_name == "person":
                             color = (255, 0, 0)  # Blue in BGR
                             results_dict["person_count"] += 1
-                        elif class_name in animal_classes:
+                        elif class_name in COARSE_ANIMAL_CLASSES:
                             color = (0, 0, 255)  # Red in BGR
                             results_dict["animal_count"] += 1
                         else:
@@ -248,7 +367,7 @@ class ImageProcessor:
                         cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
 
                         # Draw label
-                        label = f"{class_name} {confidence:.2f}"
+                        label = f"{display_class_name} {confidence:.2f}"
                         (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                         cv2.rectangle(annotated_image, (x1, y1 - 20), (x1 + w, y1), color, -1)
                         cv2.putText(

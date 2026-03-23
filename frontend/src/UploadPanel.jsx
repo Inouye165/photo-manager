@@ -59,8 +59,8 @@ export default function UploadPanel({ onUploadComplete, onToast }) {
     <section className="section-panel upload-panel">
       <div className="section-heading compact-heading">
         <div>
-          <div className="eyebrow accent">Upload To Vault</div>
-          <h2>Add Photos Without Touching Folders</h2>
+          <div className="eyebrow accent">Add photos</div>
+          <h2>Upload photos into the source vault</h2>
         </div>
       </div>
 
@@ -93,7 +93,7 @@ export default function UploadPanel({ onUploadComplete, onToast }) {
         />
 
         <strong>Drop photos here, upload several at once, or pick a folder.</strong>
-        <p>The app hashes every file, blocks duplicates, stores originals in the source vault, mirrors them instantly, and indexes detections into the vector store right after ingest.</p>
+        <p>Each file is checked for duplicates before it is added. Originals stay in the source vault, and the app builds previews and detections right after upload.</p>
         <div className="upload-actions-row">
           <button type="button" className="action action-primary upload-trigger" onClick={openFilePicker} disabled={uploading}>
             {uploading ? 'Uploading...' : 'Upload Photos'}
@@ -121,19 +121,19 @@ export default function UploadPanel({ onUploadComplete, onToast }) {
           <div className="upload-result-copy">
             <strong>{result.title}</strong>
             <span>{result.summary}</span>
-            <span>{result.detection_count} detections found. {result.uploaded_task_count} new verification task{result.uploaded_task_count === 1 ? '' : 's'} ready.</span>
+            <span>{result.detection_count} detections found. {result.uploaded_task_count} new labeling task{result.uploaded_task_count === 1 ? '' : 's'} ready.</span>
             {result.duplicate_count ? <span>{result.duplicate_count} upload attempt{result.duplicate_count === 1 ? '' : 's'} were blocked because those files already exist in the vault.</span> : null}
             {result.failure_count ? <span>{result.failure_count} file{result.failure_count === 1 ? '' : 's'} failed and were skipped.</span> : null}
           </div>
           <div className="upload-result-actions">
-            <a className="action action-primary" href={result.identity_lab_url}>View in Identity Lab</a>
+            <a className="action action-primary" href={result.identity_lab_url}>Open labeling tools</a>
           </div>
           {result.items?.filter((item) => !item.duplicate).length ? (
             <div className="upload-result-list">
               {result.items.filter((item) => !item.duplicate).slice(0, 6).map((item) => (
                 <div className="upload-result-list-item" key={`${item.clean_name}-${item.sha256 || item.original_filename || item.clean_name}`}>
                   <strong>{item.original_filename || item.clean_name}</strong>
-                  <span>Indexed as {item.clean_name} • {item.detection_count} detections</span>
+                  <span>Saved as {item.clean_name} • {item.detection_count} detections</span>
                 </div>
               ))}
               {result.items.filter((item) => !item.duplicate).length > 6 ? <div className="upload-result-list-item">+ {result.items.filter((item) => !item.duplicate).length - 6} more accepted file{result.items.filter((item) => !item.duplicate).length - 6 === 1 ? '' : 's'}</div> : null}
@@ -282,7 +282,7 @@ function normalizeUploadResult(payload, files) {
         ? payload.items[0]?.duplicate
           ? `${payload.items[0]?.original_filename || files[0]?.name || '1 photo'} was blocked because the vault already contains that file content`
           : payload.items[0]?.clean_name || files[0]?.name || '1 photo'
-        : `${payload.uploaded_count} new, ${payload.duplicate_count} blocked duplicate attempt${payload.duplicate_count === 1 ? '' : 's'}`,
+        : `${payload.uploaded_count} new, ${payload.duplicate_count} duplicate attempt${payload.duplicate_count === 1 ? '' : 's'} blocked`,
     }
   }
 

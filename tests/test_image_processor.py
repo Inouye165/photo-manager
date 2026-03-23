@@ -137,6 +137,28 @@ class TestDetectSubjects(TestImageProcessor):
         self.assertFalse(result["has_person"])
         self.assertFalse(result["has_animal"])
 
+    @patch("src.image_processor.ImageProcessor._load_image")
+    @patch("src.image_processor.ImageProcessor._refine_animal_label")
+    def test_get_detailed_detections_refines_livestock_labels(self, mock_refine_animal_label, mock_load_image):
+        """Coarse sheep/cow detections should be relabeled when the animal relabeler has a stronger match."""
+        dummy_image = np.zeros((100, 100, 3), dtype=np.uint8)
+        mock_load_image.return_value = dummy_image
+        mock_refine_animal_label.return_value = "bison"
+        self.processor.yolo_model.names[18] = "sheep"
+
+        mock_result = MagicMock()
+        mock_result.boxes = MagicMock()
+        mock_result.boxes.xyxy = [[10, 10, 50, 50]]
+        mock_result.boxes.cls = [MagicMock(item=MagicMock(return_value=18))]
+        mock_result.boxes.conf = [MagicMock(item=MagicMock(return_value=0.88))]
+        self.processor.yolo_model.return_value = [mock_result]
+
+        detections = self.processor.get_detailed_detections("test.jpg")
+
+        self.assertEqual(len(detections), 1)
+        self.assertEqual(detections[0]["class_name"], "bison")
+        mock_refine_animal_label.assert_called_once()
+
 
 class TestLoadImageHEIC(TestImageProcessor):
     """Test HEIC image loading functionality."""

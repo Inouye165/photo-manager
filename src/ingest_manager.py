@@ -22,7 +22,7 @@ from PIL import ExifTags, Image
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from src.detection_metadata import DetectionMetadata
-from src.image_processor import ImageProcessor
+from src.image_processor import ALL_ANIMAL_CLASSES, ImageProcessor
 from src.mirror_manager import MirrorManager
 
 try:
@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover
 
 
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".heic", ".heif", ".webp"}
-ANIMAL_CLASSES = {"bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"}
+ANIMAL_CLASSES = set(ALL_ANIMAL_CLASSES)
 
 
 class IngestConfig(BaseModel):

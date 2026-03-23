@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import logging
 import math
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -1112,25 +1113,17 @@ class IntelligenceCore:
         """Append one structured training event to the workspace log."""
 
         log_path = self.config.workspace_root / "logs" / "training_tasks.jsonl"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "event": event_name,
             "payload": payload,
         }
-
-        with NamedTemporaryFile(
-            "w",
-            delete=False,
-            encoding="utf-8",
-            dir=log_path.parent,
-            suffix=".tmp",
-        ) as handle:
-            if log_path.exists():
-                handle.write(log_path.read_text(encoding="utf-8"))
-            handle.write(json.dumps(entry) + "\n")
-            temp_path = Path(handle.name)
-
-        temp_path.replace(log_path)
+        try:
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry) + "\n")
+        except OSError as exc:
+            logging.warning("Could not append training event log %s: %s", log_path, exc)
 
     def close(self) -> None:
         """Release runtime resources held by the active-learning engine."""

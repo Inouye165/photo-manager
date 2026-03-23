@@ -1,5 +1,54 @@
 import { startTransition, useEffect, useMemo, useState } from 'react'
 
+function buildOriginalPreviewUrl(imagePath) {
+  return `/image/${imagePath}?variant=preview`
+}
+
+function buildOriginalFullUrl(imagePath) {
+  return `/image/${imagePath}?variant=preview`
+}
+
+function OriginalBoxPreview({ task, className = '', eager = false }) {
+  const [naturalSize, setNaturalSize] = useState(null)
+  const bbox = task?.metadata?.bbox || null
+  const originalPreviewUrl = task ? buildOriginalPreviewUrl(task.image_path) : ''
+  const sourceWidth = Number(task?.metadata?.source_width || 0)
+  const sourceHeight = Number(task?.metadata?.source_height || 0)
+
+  if (!task) {
+    return null
+  }
+
+  const referenceWidth = sourceWidth || naturalSize?.width || 0
+  const referenceHeight = sourceHeight || naturalSize?.height || 0
+
+  const overlayStyle = bbox && referenceWidth > 0 && referenceHeight > 0 ? {
+    left: `${(bbox[0] / referenceWidth) * 100}%`,
+    top: `${(bbox[1] / referenceHeight) * 100}%`,
+    width: `${((bbox[2] - bbox[0]) / referenceWidth) * 100}%`,
+    height: `${((bbox[3] - bbox[1]) / referenceHeight) * 100}%`,
+  } : null
+
+  return (
+    <div className={`compare-original-frame ${className}`.trim()}>
+      <div className="compare-original-image-wrap">
+        <img
+          src={originalPreviewUrl}
+          alt={task.image_path}
+          loading={eager ? 'eager' : 'lazy'}
+          onLoad={(event) => {
+            setNaturalSize({
+              width: event.currentTarget.naturalWidth,
+              height: event.currentTarget.naturalHeight,
+            })
+          }}
+        />
+        {overlayStyle ? <div className="compare-bbox" style={overlayStyle} /> : null}
+      </div>
+    </div>
+  )
+}
+
 function buildBatchItem(task, assignedLabel, status = 'confirmed', extra = {}) {
   return {
     image_path: task.image_path,
@@ -10,17 +59,34 @@ function buildBatchItem(task, assignedLabel, status = 'confirmed', extra = {}) {
   }
 }
 
-function SearchResults({ results }) {
-  if (!results.length) {
+function SearchResults({ results, searchMeta }) {
+  if (!searchMeta) {
     return null
+  }
+
+  if (!results.length) {
+    return (
+      <section className="semantic-results-panel">
+        <div className="section-heading compact-heading">
+          <div>
+            <div className="eyebrow accent-coral">Search labeled photos</div>
+            <h2>No matches found</h2>
+          </div>
+        </div>
+        <p style={{ padding: '1rem 0', opacity: 0.7 }}>
+          Searched {searchMeta.images_scanned} image{searchMeta.images_scanned !== 1 ? 's' : ''} ({searchMeta.detections_scanned} detection{searchMeta.detections_scanned !== 1 ? 's' : ''}) — nothing matched &ldquo;{searchMeta.query}&rdquo;.
+          {searchMeta.detections_scanned === 0 ? ' Try uploading images first so detections can be indexed.' : ' Try a different term like a detected class name (person, bird, cat, dog, horse, sheep, cow).'}
+        </p>
+      </section>
+    )
   }
 
   return (
     <section className="semantic-results-panel">
       <div className="section-heading compact-heading">
         <div>
-          <div className="eyebrow accent-coral">Semantic Search</div>
-          <h2>Nearest labeled matches</h2>
+          <div className="eyebrow accent-coral">Search labeled photos</div>
+          <h2>{results.length} match{results.length !== 1 ? 'es' : ''} found</h2>
         </div>
       </div>
       <div className="semantic-results-grid">
@@ -53,8 +119,8 @@ function BatchSuggestions({ suggestions, clusterDrafts, onClusterDraftChange, on
     <section className="batch-suggestions-panel">
       <div className="section-heading compact-heading">
         <div>
-          <div className="eyebrow accent">Batch Suggest</div>
-          <h2>Similar detections grouped for one-pass labeling</h2>
+          <div className="eyebrow accent">Group labeling</div>
+          <h2>Similar detections grouped together</h2>
         </div>
       </div>
       <div className="batch-suggestion-grid">
@@ -67,7 +133,7 @@ function BatchSuggestions({ suggestions, clusterDrafts, onClusterDraftChange, on
                 <div>
                   <div className="hero-chip">{cluster.detected_class}</div>
                   <h3>{cluster.member_count} similar crops</h3>
-                  <p>{cluster.suggested_label ? `Suggested: ${cluster.suggested_label}` : 'No label suggestion yet'}</p>
+                  <p>{cluster.suggested_label ? `Suggested name: ${cluster.suggested_label}` : 'No suggested name yet'}</p>
                 </div>
                 {cluster.preview_url ? <img src={cluster.preview_url} alt={cluster.detected_class} /> : null}
               </div>
@@ -75,10 +141,10 @@ function BatchSuggestions({ suggestions, clusterDrafts, onClusterDraftChange, on
                 <input
                   value={draftValue}
                   onChange={(event) => onClusterDraftChange(cluster.cluster_id, event.target.value)}
-                  placeholder="Apply one name to this cluster"
+                  placeholder="Apply one name to this group"
                 />
                 <button type="button" className="verify-button verify-yes compact" disabled={busy} onClick={() => onApplyCluster(cluster, draftValue)}>
-                  Label cluster
+                  Save group
                 </button>
               </div>
             </article>
@@ -89,13 +155,70 @@ function BatchSuggestions({ suggestions, clusterDrafts, onClusterDraftChange, on
   )
 }
 
-function TaskCard({ task, draftValue, clusterInfo, nameOptionsId, busy, onDraftChange, onSave, onReject, onApplyCluster }) {
+function CompareModal({ task, onClose }) {
+  const originalFullUrl = task ? buildOriginalFullUrl(task.image_path) : ''
+
+  useEffect(() => {
+    if (!task) {
+      return undefined
+    }
+
+    function handleKeyDown(event) {
+      if (event.key === 'Escape') {
+        onClose()
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [task, onClose])
+
+  if (!task) {
+    return null
+  }
+  return (
+    <div className="compare-modal-backdrop" role="dialog" aria-modal="true" onClick={onClose}>
+      <section className="compare-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="compare-modal-header">
+          <div>
+            <div className="eyebrow accent">Detection review</div>
+            <h2>{task.image_path.split('/').slice(-1)[0]}</h2>
+            <p>Detection #{task.detection_index + 1} for {task.detected_class}</p>
+          </div>
+          <div className="compare-modal-actions">
+            <a href={originalFullUrl} target="_blank" rel="noopener noreferrer" className="action action-secondary">Open original</a>
+            <button type="button" className="verify-button verify-secondary compact" onClick={onClose}>Close</button>
+          </div>
+        </div>
+
+        <div className="compare-modal-grid">
+          <figure className="compare-pane">
+            <figcaption>Crop used for labeling</figcaption>
+            {task.candidate_image_url ? <img src={task.candidate_image_url} alt={task.detected_class} loading="eager" /> : <div className="identity-task-fallback">No crop</div>}
+          </figure>
+
+          <figure className="compare-pane">
+            <figcaption>Full image with the detection box</figcaption>
+            <OriginalBoxPreview task={task} eager className="compare-original-large" />
+          </figure>
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function TaskCard({ task, draftValue, clusterInfo, nameOptionsId, busy, onDraftChange, onSave, onReject, onApplyCluster, onInspect }) {
   const suggestedLabel = task.proposed_label || ''
+  const originalPreviewUrl = buildOriginalPreviewUrl(task.image_path)
 
   return (
     <article className="identity-task-card">
       <div className="identity-task-media">
-        {task.candidate_image_url ? <img src={task.candidate_image_url} alt={task.detected_class} loading="lazy" /> : <div className="identity-task-fallback">No crop</div>}
+        {task.candidate_image_url ? (
+          <button type="button" className="identity-task-media-button" onClick={() => onInspect(task)} title="Compare crop against the original image">
+            <img src={task.candidate_image_url} alt={task.detected_class} loading="lazy" />
+          </button>
+        ) : <div className="identity-task-fallback">No crop</div>}
         <div className="identity-task-badges">
           <span className="subject-pill">{task.detected_class}</span>
           <span className={`stage-pill ${task.status === 'new_identity' ? 'spark' : task.status === 'auto_accept' ? 'dialed' : 'warming'}`}>
@@ -109,18 +232,33 @@ function TaskCard({ task, draftValue, clusterInfo, nameOptionsId, busy, onDraftC
           <div>
             <h3>{task.image_path.split('/').slice(-1)[0]}</h3>
             <p>Detection #{task.detection_index + 1}</p>
+            <p className="identity-task-format-note">The label applies only to the boxed subject. Source files can stay HEIC, while the app shows a browser-safe WebP preview.</p>
+            <div className="identity-task-links">
+              <button type="button" className="view-original-link button-link" onClick={() => onInspect(task)}>View full image</button>
+              <a href={originalPreviewUrl} target="_blank" rel="noopener noreferrer" className="view-original-link">Open original</a>
+            </div>
           </div>
-          {clusterInfo ? <span className="hero-chip">Cluster of {clusterInfo.member_count}</span> : null}
+          {clusterInfo ? <span className="hero-chip">Group of {clusterInfo.member_count}</span> : null}
         </div>
 
         {suggestedLabel ? (
           <div className="identity-task-suggestion">
             <strong>{suggestedLabel}</strong>
-            <span>{task.hits?.length ? `${Math.round(((task.hits[0].score + 1) / 2) * 100)}% nearest match` : 'Suggested from memory'}</span>
+            <span>{task.hits?.length ? `${Math.round(((task.hits[0].score + 1) / 2) * 100)}% closest match` : 'Suggested from saved labels'}</span>
           </div>
         ) : (
           <div className="identity-task-suggestion muted">No strong suggestion yet. Type a new or existing name.</div>
         )}
+
+        <div className="identity-task-original-preview">
+          <div className="identity-task-original-header">
+            <strong>Original image</strong>
+            <span>Red box = subject you are labeling</span>
+          </div>
+          <button type="button" className="identity-task-original-button" onClick={() => onInspect(task)}>
+            <OriginalBoxPreview task={task} className="identity-task-original-frame" />
+          </button>
+        </div>
 
         <div className="identity-task-inputs">
           <input
@@ -148,7 +286,7 @@ function TaskCard({ task, draftValue, clusterInfo, nameOptionsId, busy, onDraftC
           </button>
           {clusterInfo ? (
             <button type="button" className="verify-button verify-secondary compact" disabled={busy} onClick={() => onApplyCluster(clusterInfo, draftValue || suggestedLabel)}>
-              Apply to {clusterInfo.member_count}
+              Save all {clusterInfo.member_count}
             </button>
           ) : null}
           <button type="button" className="verify-button verify-no compact" disabled={busy} onClick={() => onReject(task)}>
@@ -220,6 +358,8 @@ export default function IdentityLab({ onToast }) {
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState('')
   const [searchResults, setSearchResults] = useState([])
+  const [searchMeta, setSearchMeta] = useState(null)
+  const [inspectedTask, setInspectedTask] = useState(null)
 
   const nameOptionsId = 'identity-lab-name-options'
   const clusterMap = useMemo(() => new Map(payload.batch_suggestions.map((cluster) => [cluster.cluster_id, cluster])), [payload.batch_suggestions])
@@ -331,6 +471,7 @@ export default function IdentityLab({ onToast }) {
     const query = searchQuery.trim()
     if (!query) {
       setSearchResults([])
+      setSearchMeta(null)
       setSearchError('')
       return
     }
@@ -345,9 +486,11 @@ export default function IdentityLab({ onToast }) {
 
       const result = await response.json()
       setSearchResults(result.results || [])
+      setSearchMeta({ query, images_scanned: result.images_scanned ?? 0, detections_scanned: result.detections_scanned ?? 0 })
       setSearchError('')
     } catch (requestError) {
       setSearchResults([])
+      setSearchMeta(null)
       setSearchError(requestError.message || 'Semantic search failed')
     } finally {
       setSearching(false)
@@ -358,26 +501,26 @@ export default function IdentityLab({ onToast }) {
     <section className="identity-lab-shell batch-lab-shell">
       <section className="hero-panel identity-lab-hero">
         <div>
-          <div className="eyebrow">Batch Labeling</div>
-          <h1>Label crops in parallel. Search the memory in plain language.</h1>
-          <p>Every card is a detection crop. Type once, accept suggestions fast, and push cluster labels across visually similar detections in one pass.</p>
+          <div className="eyebrow">Labeling tools</div>
+          <h1>Label detections faster and search saved photos</h1>
+          <p>Each card is one detection crop. Save a name, accept a suggested match, or apply one name across a similar group.</p>
           <div className="hero-actions">
             <a className="action action-primary" href="/lab">Classic Queue</a>
-            <a className="action action-secondary" href="/">Atlas Home</a>
+            <a className="action action-secondary" href="/">Photo Browser</a>
           </div>
         </div>
         <aside className="hero-sidebar">
-          <div className="hero-chip">Session State</div>
+          <div className="hero-chip">Right now</div>
           <h2>{payload.stats.task_count} crops ready</h2>
-          <p>{payload.stats.suggested_count} already have model label suggestions. {payload.stats.cluster_count} similarity clusters are ready for one-pass labeling. {payload.stats.confirmed_count} confirmed labels can be edited in place.</p>
+          <p>{payload.stats.suggested_count} already have suggested names. {payload.stats.cluster_count} groups are ready for batch labeling. {payload.stats.confirmed_count} saved labels can be edited here.</p>
         </aside>
       </section>
 
-      <section className="semantic-search-panel">
+      <section className="semantic-search-panel" id="semantic-search">
         <form className="semantic-search-form" onSubmit={handleSemanticSearch}>
           <div>
-            <div className="eyebrow accent">Semantic Search</div>
-            <h2>Find labeled photos by description</h2>
+            <div className="eyebrow accent">Search labeled photos</div>
+            <h2>Find saved photos by description</h2>
           </div>
           <div className="semantic-search-controls">
             <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Try: small brown dog on grass, Ron in blue shirt, bird on branch" />
@@ -385,11 +528,11 @@ export default function IdentityLab({ onToast }) {
           </div>
         </form>
         {searchError ? <div className="status-panel error">{searchError}</div> : null}
-        <SearchResults results={searchResults} />
+        <SearchResults results={searchResults} searchMeta={searchMeta} />
       </section>
 
       {error ? <section className="status-panel error">{error}</section> : null}
-      {loading ? <section className="status-panel">Loading batch labeling tasks...</section> : null}
+      {loading ? <section className="status-panel">Loading labeling tools...</section> : null}
 
       <BatchSuggestions
         suggestions={payload.batch_suggestions}
@@ -417,6 +560,7 @@ export default function IdentityLab({ onToast }) {
               onSave={handleSave}
               onReject={handleReject}
               onApplyCluster={handleApplyCluster}
+              onInspect={setInspectedTask}
             />
           ))}
         </section>
@@ -430,8 +574,8 @@ export default function IdentityLab({ onToast }) {
         <section className="semantic-results-panel">
           <div className="section-heading compact-heading">
             <div>
-              <div className="eyebrow accent">Confirmed Labels</div>
-              <h2>Edit labels without leaving Identity Lab</h2>
+              <div className="eyebrow accent">Saved labels</div>
+              <h2>Edit saved labels here</h2>
             </div>
           </div>
           <section className="identity-task-grid confirmed-task-grid">
@@ -451,6 +595,8 @@ export default function IdentityLab({ onToast }) {
           </section>
         </section>
       ) : null}
+
+      <CompareModal task={inspectedTask} onClose={() => setInspectedTask(null)} />
     </section>
   )
 }

@@ -2,7 +2,7 @@ import os
 import shutil
 import sys
 
-from src.image_processor import ImageProcessor
+from src.image_processor import ALL_ANIMAL_CLASSES, ImageProcessor
 from src.detection_metadata import DetectionMetadata
 
 
@@ -117,7 +117,7 @@ def main():
                                 # Determine crop directory
                                 if class_name == "person":
                                     crop_dir = people_crops_dir
-                                elif class_name in {"bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"}:
+                                elif class_name in ALL_ANIMAL_CLASSES:
                                     crop_dir = animals_crops_dir
                                 else:
                                     continue  # Skip other classes

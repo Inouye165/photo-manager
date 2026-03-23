@@ -11,6 +11,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import pillow_heif
+from PIL import Image, ImageOps
+
+pillow_heif.register_heif_opener()
+
 
 class LabelManager:
     """Manages label storage and retrieval for detected objects"""
@@ -173,14 +178,34 @@ class LabelManager:
             detection_index = label_record.get("detection_index", 0)
 
             if image_source and image_source.exists():
-                image_target = images_dir / f"{image_source.stem}_det_{detection_index}{image_source.suffix}"
-                shutil.copy2(image_source, image_target)
+                image_target = self._build_export_image_target(images_dir, image_source, detection_index)
+                self._export_image_file(image_source, image_target)
 
             if crop_source and crop_source.exists():
                 crop_target = crops_dir / f"{crop_source.stem}_label_{safe_label}{crop_source.suffix}"
                 shutil.copy2(crop_source, crop_target)
 
         return str(export_root)
+
+    def _build_export_image_target(self, images_dir: Path, image_source: Path, detection_index: int) -> Path:
+        """Choose a browser-safe export target name for source images."""
+        suffix = image_source.suffix.lower()
+        if suffix in {".heic", ".heif"}:
+            return images_dir / f"{image_source.stem}_det_{detection_index}.webp"
+        return images_dir / f"{image_source.stem}_det_{detection_index}{image_source.suffix}"
+
+    def _export_image_file(self, image_source: Path, image_target: Path) -> None:
+        """Export an image, transcoding HEIC/HEIF sources to WebP for compatibility."""
+        suffix = image_source.suffix.lower()
+        if suffix in {".heic", ".heif"}:
+            with Image.open(image_source) as opened_image:
+                image = ImageOps.exif_transpose(opened_image)
+                if image.mode != "RGB":
+                    image = image.convert("RGB")
+                image.save(image_target, "WEBP", quality=90)
+            return
+
+        shutil.copy2(image_source, image_target)
     
     def get_label(self, label_id: str) -> Optional[Dict]:
         """Get a specific label by ID"""
